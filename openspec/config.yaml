@@ -1,0 +1,39 @@
+schema: spec-driven
+
+context: |
+  Python 3.11+ library `orchestrator` (src layout: src/orchestrator/), standard library only at runtime.
+  Tests use pytest + pytest-asyncio (asyncio_mode=auto) under tests/. Run: python3 -m pytest -q
+  Tool invocation is async (async def handlers). Everything must be deterministic and testable without network.
+  Each capability lives in its own module; modules depend on orchestrator.core (models, errors) and orchestrator.registry,
+  never on each other except where a spec states it. The top-level Orchestrator in orchestrator/agent.py composes them.
+
+# Project context (optional)
+# Add only constraints that should guide OpenSpec artifacts and workflows.
+# Include constraints an agent cannot infer by reading the code.
+# Keep general project documentation and discoverable codebase facts out.
+# Example:
+#   context: |
+#     Designs and tasks must cover Windows, macOS, and Linux
+#     Write all artifacts in Spanish
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always state what is out of scope
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
