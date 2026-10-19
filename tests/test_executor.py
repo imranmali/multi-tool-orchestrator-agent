@@ -846,3 +846,122 @@ class TestReport:
             Plan([Step("slow", tool="nap", args={"d": 0.02}), Step("fast", tool="nap", args={"d": 0})])
         )
         assert list(report.results) == ["slow", "fast"]
+
+
+# ---------------------------------------------------------------------------
+# Regression tests from the spec audit of the archived capability
+# ---------------------------------------------------------------------------
+
+
+class TestAuditRegressions:
+    @pytest.mark.parametrize("path", ["items.--1", "items.²", "items.-", "items.1_0"])
+    async def test_malformed_index_fails_only_the_referencing_step(self, path):
+        async def obj(**_):
+            return {"items": [1, 2, 3]}
+
+        inv = FnInvoker(obj=obj, ok=ok)
+        report = await ParallelExecutor(inv).run(
+            Plan(
+                [
+                    Step("a", tool="obj"),
+                    Step("b", tool="ok", args={"x": Ref("a", path)}),
+                    Step("c", tool="ok"),
+                ]
+            )
+        )
+        assert report["b"].status == "failed"
+        assert isinstance(report["b"].exception, ValidationError)
+        assert not inv.called("b")
+        assert report["a"].ok and report["c"].ok
+
+    async def test_negative_index_still_resolves(self):
+        async def obj(**_):
+            return {"items": [1, 2, 3]}
+
+        inv = FnInvoker(obj=obj, ok=ok)
+        report = await ParallelExecutor(inv).run(
+            Plan([Step("a", tool="obj"), Step("b", tool="ok", args={"x": Ref("a", "items.-1")})])
+        )
+        assert report["b"].value == 3
+
+    async def test_cancelled_error_raised_by_tool_is_a_step_failure(self):
+        async def cancels(**_):
+            child = asyncio.ensure_future(asyncio.sleep(10))
+            child.cancel()
+            await child  # re-raises CancelledError inside the tool
+
+        async def slow(**_):
+            await asyncio.sleep(0.02)
+            return "done"
+
+        inv = FnInvoker(cancels=cancels, slow=slow, ok=ok)
+        report = await ParallelExecutor(inv).run(
+            Plan(
+                [
+                    Step("a", tool="cancels", retries=1),
+                    Step("b", tool="slow"),
+                    Step("c", tool="ok", depends_on=("a",)),
+                ]
+            )
+        )
+        assert report["a"].status == "failed"
+        assert report["a"].attempts == 2
+        assert "CancelledError" in report["a"].error
+        assert report["b"].ok and report["b"].value == "done"
+        assert report["c"].status == "skipped"
+
+    async def test_external_cancellation_still_propagates(self):
+        async def sleepy(**_):
+            await asyncio.sleep(10)
+
+        task = asyncio.create_task(
+            ParallelExecutor(FnInvoker(sleepy=sleepy)).run(Plan([Step("a", tool="sleepy")]))
+        )
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    async def test_tool_raised_timeout_error_is_not_an_executor_timeout(self):
+        async def gateway(**_):
+            raise TimeoutError("upstream gateway timeout")
+
+        report = await ParallelExecutor(FnInvoker(gateway=gateway)).run(
+            Plan([Step("a", tool="gateway")])
+        )
+        out = report["a"]
+        assert out.status == "failed"
+        assert not isinstance(out.exception, ToolTimeoutError)
+        assert isinstance(out.exception, TimeoutError)
+        assert out.error == "TimeoutError: upstream gateway timeout"
+
+    async def test_tool_raised_timeout_error_with_timeout_configured(self):
+        async def gateway(**_):
+            raise TimeoutError("upstream gateway timeout")
+
+        report = await ParallelExecutor(FnInvoker(gateway=gateway)).run(
+            Plan([Step("a", tool="gateway", timeout=5)])
+        )
+        assert not isinstance(report["a"].exception, ToolTimeoutError)
+        assert "upstream gateway timeout" in report["a"].error
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_long_chain_does_not_hit_recursion_limit(self, reverse):
+        n = 3000
+        steps = [Step("s0", tool="t")] + [
+            Step(f"s{i}", tool="t", depends_on=(f"s{i - 1}",)) for i in range(1, n)
+        ]
+        if reverse:
+            steps.reverse()
+        plan = Plan(steps)
+        assert plan.levels() == [[f"s{i}"] for i in range(n)]
+        assert plan.order() == [f"s{i}" for i in range(n)]
+
+    def test_long_cycle_detected_iteratively(self):
+        n = 3000
+        steps = [Step(f"s{i}", tool="t", depends_on=(f"s{(i + 1) % n}",)) for i in range(n)]
+        with pytest.raises(CycleError) as info:
+            Plan(steps)
+        message = str(info.value)
+        assert message.startswith("dependency cycle: s0 -> s1 -> ")
+        assert message.endswith(" -> s0")

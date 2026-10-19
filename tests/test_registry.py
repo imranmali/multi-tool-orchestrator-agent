@@ -96,3 +96,59 @@ def test_failing_listener_isolated(tool_factory):
     reg.register(tool_factory("a"))
     assert "a" in reg
     assert len(seen) == 1
+
+
+# -- regression tests from the spec audit -------------------------------------
+
+
+def test_name_disable_survives_new_version(tool_factory):
+    reg = ToolRegistry()
+    reg.register(tool_factory("calc", "1.0.0", caps=("math",)))
+    reg.disable("calc")
+    reg.register(tool_factory("calc", "1.1.0", caps=("math",)))
+    assert reg.find_by_capability("math") == []
+    assert not reg.is_enabled("calc")
+    assert not reg.is_enabled("calc", "1.1.0")
+    assert reg.list(include_disabled=False) == []
+    reg.enable("calc")
+    assert [s.version for s in reg.find_by_capability("math")] == ["1.1.0"]
+    assert reg.is_enabled("calc")
+
+
+def test_name_disable_survives_unregistering_latest(tool_factory):
+    reg = ToolRegistry()
+    reg.register(tool_factory("calc", "1.0.0", caps=("math",)))
+    reg.register(tool_factory("calc", "2.0.0", caps=("math",)))
+    reg.disable("calc")
+    reg.unregister("calc", "2.0.0")
+    assert reg.find_by_capability("math") == []
+    assert not reg.is_enabled("calc")
+
+
+def test_version_disable_is_version_scoped(tool_factory):
+    reg = ToolRegistry()
+    reg.register(tool_factory("calc", "1.0.0", caps=("math",)))
+    reg.disable("calc", "1.0.0")
+    reg.register(tool_factory("calc", "1.1.0", caps=("math",)))
+    assert [s.version for s in reg.find_by_capability("math")] == ["1.1.0"]
+    assert not reg.is_enabled("calc", "1.0.0")
+
+
+def test_name_disable_forgotten_after_full_unregister(tool_factory):
+    reg = ToolRegistry()
+    reg.register(tool_factory("calc", caps=("math",)))
+    reg.disable("calc")
+    reg.unregister("calc")
+    reg.register(tool_factory("calc", caps=("math",)))
+    assert reg.is_enabled("calc")
+    assert [s.name for s in reg.find_by_capability("math")] == ["calc"]
+
+
+def test_newline_suffixed_version_cannot_dodge_duplicate_check(tool_factory):
+    from orchestrator import ValidationError
+
+    reg = ToolRegistry()
+    reg.register(tool_factory("calc", "1.0.0"))
+    with pytest.raises(ValidationError):
+        reg.register(tool_factory("calc", "1.0.0\n"))
+    assert reg.versions("calc") == ["1.0.0"]

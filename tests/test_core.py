@@ -63,3 +63,45 @@ def test_validate_input():
         spec.validate_input({})
     with pytest.raises(ValidationError):
         spec.validate_input({"q": 1})
+
+
+# -- regression tests from the spec audit -------------------------------------
+
+
+@pytest.mark.parametrize("name", ["calc\n", "calc\n\n", "١calc", "Calc"])
+def test_tool_name_must_fully_match(name):
+    with pytest.raises(ValidationError):
+        ToolSpec(name, "1.0.0", ("search",), _h)
+
+
+@pytest.mark.parametrize(
+    "version", ["1.0.0\n", "01.0.0", "1.00.0", "1.0.01", "1.0.١", "1.0", 100]
+)
+def test_version_must_be_strict_semver(version):
+    with pytest.raises(ValidationError):
+        ToolSpec("calc", version, ("search",), _h)
+
+
+def test_zero_version_parts_allowed():
+    assert ToolSpec("calc", "0.10.0", ("search",), _h).version_tuple == (0, 10, 0)
+
+
+def test_capability_name_must_fully_match():
+    with pytest.raises(ValidationError):
+        Capability("search\n")
+
+
+@pytest.mark.parametrize("field", ["cost", "latency"])
+@pytest.mark.parametrize("bad", [float("nan"), "a", None, True, -0.1, float("-inf")])
+def test_capability_hints_must_be_non_negative_numbers(field, bad):
+    with pytest.raises(ValidationError):
+        Capability("search", **{field: bad})
+
+
+def test_capability_infinite_hint_is_non_negative():
+    assert Capability("search", cost=float("inf")).cost == float("inf")
+
+
+def test_capability_priority_rejects_bool():
+    with pytest.raises(ValidationError):
+        Capability("search", priority=True)

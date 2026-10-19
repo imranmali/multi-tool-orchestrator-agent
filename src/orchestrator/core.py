@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import inspect
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Mapping
 
 Handler = Callable[..., Awaitable[Any]]
 
-_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
-_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+# Patterns are applied with ``fullmatch`` (``$`` would also accept a trailing
+# newline) and use ASCII classes only (``\d`` matches non-ASCII digits).
+_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_.-]*")
+_VERSION_RE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
 
 class OrchestratorError(Exception):
@@ -54,11 +57,15 @@ class CycleError(ValidationError):
 
 
 def parse_version(version: str) -> tuple[int, int, int]:
-    match = _VERSION_RE.match(version)
+    match = _VERSION_RE.fullmatch(version) if isinstance(version, str) else None
     if not match:
         raise ValidationError(f"invalid semantic version {version!r}; expected MAJOR.MINOR.PATCH")
     major, minor, patch = (int(part) for part in match.groups())
     return major, minor, patch
+
+
+def _valid_name(name: object) -> bool:
+    return isinstance(name, str) and _NAME_RE.fullmatch(name) is not None
 
 
 @dataclass(frozen=True)
@@ -71,13 +78,21 @@ class Capability:
     priority: int = 0
 
     def __post_init__(self) -> None:
-        if not self.name or not _NAME_RE.match(self.name):
+        if not _valid_name(self.name):
             raise ValidationError(f"invalid capability name {self.name!r}")
-        if self.cost < 0:
-            raise ValidationError(f"capability {self.name!r}: cost must be >= 0")
-        if self.latency < 0:
-            raise ValidationError(f"capability {self.name!r}: latency must be >= 0")
-        if not isinstance(self.priority, int):
+        for hint in ("cost", "latency"):
+            value = getattr(self, hint)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or math.isnan(value)
+                or value < 0
+            ):
+                raise ValidationError(
+                    f"capability {self.name!r}: {hint} must be a non-negative number, "
+                    f"got {value!r}"
+                )
+        if isinstance(self.priority, bool) or not isinstance(self.priority, int):
             raise ValidationError(f"capability {self.name!r}: priority must be an int")
 
 
@@ -95,7 +110,7 @@ class ToolSpec:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.name or not _NAME_RE.match(self.name):
+        if not _valid_name(self.name):
             raise ValidationError(f"invalid tool name {self.name!r}")
         parse_version(self.version)
         caps = tuple(
