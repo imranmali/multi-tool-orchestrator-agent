@@ -3,6 +3,7 @@ import itertools
 import threading
 
 import pytest
+from conftest import make_tool
 
 from orchestrator.core import PermissionDeniedError, ValidationError
 from orchestrator.permissions import (
@@ -15,9 +16,6 @@ from orchestrator.permissions import (
     validate_scope,
 )
 
-from conftest import make_tool
-
-
 # --------------------------------------------------------------- scope syntax
 
 
@@ -26,7 +24,9 @@ def test_well_formed_scopes_accepted():
     assert p.scopes == frozenset({"fs:read", "net:http:get", "fs:*", "*"})
 
 
-@pytest.mark.parametrize("bad", ["", "fs::read", "fs:", ":fs", "fs:*:read", "f*", "fs read", "*:fs"])
+@pytest.mark.parametrize(
+    "bad", ["", "fs::read", "fs:", ":fs", "fs:*:read", "f*", "fs read", "*:fs"]
+)
 def test_malformed_scopes_rejected(bad):
     with pytest.raises(ValidationError):
         validate_scope(bad)
@@ -99,7 +99,9 @@ def test_principal_is_immutable():
     assert p.scopes == frozenset({"fs:read"})
 
 
-@pytest.mark.parametrize("kwargs", [{"id": ""}, {"id": "a", "roles": {""}}, {"id": "a", "roles": "admin"}])
+@pytest.mark.parametrize(
+    "kwargs", [{"id": ""}, {"id": "a", "roles": {""}}, {"id": "a", "roles": "admin"}]
+)
 def test_invalid_principal_rejected(kwargs):
     with pytest.raises(ValidationError):
         Principal(**kwargs)
@@ -238,7 +240,9 @@ def test_all_required_scopes_covered():
 
 def test_missing_scope():
     policy = PermissionPolicy()
-    decision = policy.decide(Principal("a", {"fs:read"}), make_tool(scopes=["fs:read", "net:http:get"]))
+    decision = policy.decide(
+        Principal("a", {"fs:read"}), make_tool(scopes=["fs:read", "net:http:get"])
+    )
     assert not decision.allowed
     assert decision.missing == frozenset({"net:http:get"})
 
@@ -307,7 +311,8 @@ def test_explicit_allow_bypasses_scopes():
 def test_explicit_allow_by_role():
     policy = PermissionPolicy()
     policy.allow_tool("auditor", "report")
-    assert policy.allowed(Principal("x", roles={"auditor"}), make_tool("report", scopes=["db:read"]))
+    tool = make_tool("report", scopes=["db:read"])
+    assert policy.allowed(Principal("x", roles={"auditor"}), tool)
 
 
 def test_explicit_allow_bounded_by_parent():

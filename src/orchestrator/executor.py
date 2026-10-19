@@ -16,19 +16,10 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
-from typing import (
-    Any,
-    AsyncContextManager,
-    Awaitable,
-    Callable,
-    Iterable,
-    Iterator,
-    Literal,
-    Mapping,
-    Protocol,
-    Sequence,
-)
+from typing import Any, Literal, Protocol
 
 from .core import (
     CycleError,
@@ -253,7 +244,7 @@ class Plan:
                     stack.pop()
                     color[path.pop()] = black
                 elif color[dep] == grey:
-                    cycle = path[path.index(dep):] + [dep]
+                    cycle = [*path[path.index(dep):], dep]
                     raise CycleError("dependency cycle: " + " -> ".join(cycle))
                 elif color[dep] == white:
                     color[dep] = grey
@@ -329,7 +320,7 @@ Invoker = Callable[[Step, dict[str, Any]], Awaitable[ToolResult]]
 class LockManager(Protocol):
     """Duck-typed resource lock manager (e.g. the conflicts module's)."""
 
-    def hold(self, owner: str, resources: Mapping[str, str]) -> AsyncContextManager[Any]:
+    def hold(self, owner: str, resources: Mapping[str, str]) -> AbstractAsyncContextManager[Any]:
         """Context manager holding ``resources`` (name → "read"/"write") for ``owner``."""
         ...
 
@@ -465,7 +456,7 @@ class ExecutionReport:
 
 
 class _Progress:
-    __slots__ = ("started_at", "attempts")
+    __slots__ = ("attempts", "started_at")
 
     def __init__(self) -> None:
         self.started_at: float | None = None
@@ -512,7 +503,9 @@ class ParallelExecutor:
                 if sid in outcomes or sid in progress:
                     continue
                 step = plan[sid]
-                dep_states = [outcomes[d].status if d in outcomes else None for d in step.depends_on]
+                dep_states = [
+                    outcomes[d].status if d in outcomes else None for d in step.depends_on
+                ]
                 if any(state not in (None, "succeeded") for state in dep_states):
                     outcomes[sid] = StepOutcome(sid, "skipped", error=_skip_reason(step, outcomes))
                     self._emit(StepEvent("skipped", sid, error=outcomes[sid].error))
@@ -540,7 +533,9 @@ class ParallelExecutor:
                     _mark_skipped(plan, order, outcomes, self._emit)
                     for sid in order:
                         if sid not in outcomes:
-                            outcomes[sid] = StepOutcome(sid, "cancelled", error="cancelled (fail-fast)")
+                            outcomes[sid] = StepOutcome(
+                                sid, "cancelled", error="cancelled (fail-fast)"
+                            )
                             self._emit(StepEvent("cancelled", sid))
                     break
                 schedule()
@@ -585,7 +580,7 @@ class ParallelExecutor:
             task.cancel()
         results = await asyncio.gather(*tasks, return_exceptions=True)
         now = time.monotonic()
-        for task, result in zip(tasks, results):
+        for task, result in zip(tasks, results, strict=True):
             sid = running.pop(task)
             if isinstance(result, StepOutcome):  # finished before the cancel landed
                 outcomes[sid] = result
@@ -612,7 +607,7 @@ class ParallelExecutor:
         self._emit(StepEvent("started", step.id))
         try:
             args = _resolve_refs(step.args, outputs)
-        except Exception as exc:  # noqa: BLE001 - an unresolvable ref fails only this step
+        except Exception as exc:
             return self._failed(step, prog, f"{type(exc).__name__}: {exc}", exc=exc)
 
         last_result: ToolResult | None = None
@@ -633,9 +628,11 @@ class ParallelExecutor:
                 # The tool itself raised CancelledError (e.g. it awaited a child
                 # task that was cancelled): an ordinary failed attempt.
                 last_exc, last_result = exc, None
-                error = f"CancelledError: {exc}" if str(exc) else "CancelledError: tool was cancelled"
+                error = (
+                    f"CancelledError: {exc}" if str(exc) else "CancelledError: tool was cancelled"
+                )
                 continue
-            except Exception as exc:  # noqa: BLE001 - every failure becomes an outcome
+            except Exception as exc:
                 last_exc, last_result = exc, None
                 error = f"{type(exc).__name__}: {exc}"
                 continue
@@ -660,9 +657,8 @@ class ParallelExecutor:
         # Lock first, then the concurrency slot: see design.md (no idle slots
         # parked on contended resources; slot holders never wait on locks).
         if self.lock_manager is not None and step.resources:
-            async with self.lock_manager.hold(step.id, step.resources):
-                async with semaphore:
-                    return await self._invoke(step, args)
+            async with self.lock_manager.hold(step.id, step.resources), semaphore:
+                return await self._invoke(step, args)
         async with semaphore:
             return await self._invoke(step, args)
 
@@ -711,7 +707,7 @@ class ParallelExecutor:
             return
         try:
             self.on_event(event)
-        except Exception:  # noqa: BLE001 - observers must never break execution
+        except Exception:
             logger.exception("executor event listener failed for %s", event)
 
 

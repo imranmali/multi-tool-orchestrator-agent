@@ -301,7 +301,10 @@ def _trace(report: RunReport, step_id: str) -> str:
 def _audit_line(report: RunReport) -> str:
     allowed = sum(1 for r in report.audit if r.allowed)
     denied = len(report.audit) - allowed
-    return f"audit: {len(report.audit)} checks in {report.run_id} ({allowed} allowed, {denied} denied)"
+    return (
+        f"audit: {len(report.audit)} checks in {report.run_id} "
+        f"({allowed} allowed, {denied} denied)"
+    )
 
 
 async def collect_demo() -> DemoResult:
@@ -406,7 +409,9 @@ async def collect_demo() -> DemoResult:
                 orch.router.route("search", eligible=policy.predicate(who)).name,
                 len(eligible),
             ))
-        lines.append("  registry: search.flaky disabled for maintenance; routing reflects it at once")
+        lines.append(
+            "  registry: search.flaky disabled for maintenance; routing reflects it at once"
+        )
         lines += _table(("principal", "effective scopes", "search routes to", "usable tools"), rows)
         run3 = await orch.run(
             [Step("lookup", capability="search", args={"query": DEMO_QUERY}),
@@ -415,7 +420,8 @@ async def collect_demo() -> DemoResult:
         )
         result.runs["delegated"] = run3
         lines.append(
-            f"  {run3.run_id} as lead/helper: lookup served by {', '.join(run3.served_by['lookup'])}"
+            f"  {run3.run_id} as lead/helper: lookup served by "
+            f"{', '.join(run3.served_by['lookup'])}"
             f", digest = {_short(run3.outputs['digest'])}"
         )
         scout_issues = orch.check_plan(
@@ -441,7 +447,11 @@ async def collect_demo() -> DemoResult:
             bot,
         )
         result.runs["contention"] = run4
-        _section(lines, f"4. Contention: policy.delegate(root) -> root/report-bot saves two reports ({run4.run_id})")
+        _section(
+            lines,
+            "4. Contention: policy.delegate(root) -> root/report-bot saves two reports "
+            f"({run4.run_id})",
+        )
         for warning in run4.warnings:
             lines.append(f"  warning: {warning}")
         lines += _table(("step", "status", "served by", "output / error"), _step_rows(run4))

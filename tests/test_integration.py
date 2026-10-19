@@ -203,9 +203,11 @@ async def test_full_plan_report():
     assert [(r.tool, r.allowed) for r in report.audit if not r.allowed] == [("fs.write", False)]
     assert {r.principal_id for r in report.audit} == {"ana"}
     assert sorted(r.tool for r in report.audit) == sorted(
-        ["search.flaky", "search.alpha"]
-        + ["search.flaky", "search.alpha", "search.beta", "search.gamma"]
-        + ["calc", "render", "fs.write", "logger", "logger"]
+        [
+            *["search.flaky", "search.alpha"],
+            *["search.flaky", "search.alpha", "search.beta", "search.gamma"],
+            *["calc", "render", "fs.write", "logger", "logger"],
+        ]
     )
 
     # pre-flight issue and contention warnings
@@ -370,7 +372,7 @@ async def test_registry_changes_between_runs():
 
     orch.registry.unregister("search.fresh")
     assert orch.router.stats("search.fresh").calls == 0
-    report = await orch.run(step + [Step("n", tool="search.fresh", args={"query": "q"})], ana)
+    report = await orch.run([*step, Step("n", tool="search.fresh", args={"query": "q"})], ana)
     assert report.served_by["s"] == ("search.alpha",)
     assert [(i.step_id, i.kind) for i in report.issues] == [("n", "unknown_tool")]
     assert report.failed == ["n"]

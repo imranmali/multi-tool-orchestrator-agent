@@ -28,7 +28,6 @@ from orchestrator.executor import (
 )
 from orchestrator.registry import ToolRegistry
 
-
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -226,7 +225,9 @@ class TestRefs:
             return {"present": 1}
 
         inv = FnInvoker(obj=obj, ok=ok)
-        report = run_plan(inv, [Step("a", tool="obj"), Step("b", tool="ok", args={"x": Ref("a", "missing")})])
+        report = run_plan(
+            inv, [Step("a", tool="obj"), Step("b", tool="ok", args={"x": Ref("a", "missing")})]
+        )
         out = report["b"]
         assert out.status == "failed" and out.attempts == 0
         assert "missing" in out.error
@@ -237,7 +238,9 @@ class TestRefs:
             return [1]
 
         inv = FnInvoker(lst=lst, ok=ok)
-        report = run_plan(inv, [Step("a", tool="lst"), Step("b", tool="ok", args={"x": Ref("a", "5")})])
+        report = run_plan(
+            inv, [Step("a", tool="lst"), Step("b", tool="ok", args={"x": Ref("a", "5")})]
+        )
         assert report["b"].status == "failed"
 
 
@@ -312,7 +315,11 @@ class TestParallelism:
 
         inv = FnInvoker(slow=slow, fast=fast, after=after)
         plan = Plan(
-            [Step("a", tool="slow"), Step("b", tool="fast"), Step("c", tool="after", depends_on=("b",))]
+            [
+                Step("a", tool="slow"),
+                Step("b", tool="fast"),
+                Step("c", tool="after", depends_on=("b",)),
+            ]
         )
         assert plan.levels() == [["a", "b"], ["c"]]
         report = await ParallelExecutor(inv, default_timeout=1.0).run(plan)
@@ -699,7 +706,12 @@ class TestDefaultInvoker:
         )
         executor = ParallelExecutor(default_invoker(reg))
         report = await executor.run(
-            Plan([Step("a", tool="calc", version="1.0.0", args={"a": 2, "b": 3}), Step("b", tool="calc")])
+            Plan(
+                [
+                    Step("a", tool="calc", version="1.0.0", args={"a": 2, "b": 3}),
+                    Step("b", tool="calc"),
+                ]
+            )
         )
         assert report.ok
         assert report.outputs == {"a": 5, "b": "v2"}
@@ -843,7 +855,12 @@ class TestReport:
             await asyncio.sleep(kw["d"])
 
         report = await ParallelExecutor(FnInvoker(nap=nap)).run(
-            Plan([Step("slow", tool="nap", args={"d": 0.02}), Step("fast", tool="nap", args={"d": 0})])
+            Plan(
+                [
+                    Step("slow", tool="nap", args={"d": 0.02}),
+                    Step("fast", tool="nap", args={"d": 0}),
+                ]
+            )
         )
         assert list(report.results) == ["slow", "fast"]
 
