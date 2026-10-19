@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Literal
 
 from .core import DuplicateToolError, ToolNotFoundError, ToolSpec, parse_version
 
@@ -31,10 +32,10 @@ class ToolRegistry:
         self._lock = threading.RLock()
         self._tools: dict[str, dict[str, ToolSpec]] = {}
         # Version-level disablement (``disable(name, version)``) and name-level
-        # disablement (``disable(name)``). Name-level disablement is sticky: it
-        # applies to whichever version is the latest *now*, so registering a newer
-        # version or unregistering the latest one cannot silently re-expose the
-        # tool to discovery. Older versions pinned explicitly keep their own state.
+        # disablement (``disable(name)``). A name-level flag overrides every
+        # version of the name, including versions registered while it is set, so
+        # neither a pinned older version nor a newly registered one can slip
+        # through. ``enable(name)`` clears both kinds of flag for the name.
         self._disabled: set[tuple[str, str]] = set()
         self._disabled_names: set[str] = set()
         self._listeners: list[Listener] = []
@@ -68,11 +69,20 @@ class ToolRegistry:
         return removed
 
     def disable(self, name: str, version: str | None = None) -> None:
-        """Disable one version, or the tool name (its latest version, now and later)."""
+        """Disable one version, or the whole tool name (every version, now and later).
+
+        Emits one ``disabled`` event naming ``version``, or the latest version when
+        the whole name is disabled.
+        """
         self._set_enabled(name, version, enabled=False)
 
     def enable(self, name: str, version: str | None = None) -> None:
-        """Enable one version, or the whole tool (clears name-level disablement)."""
+        """Enable one version, or the whole tool name.
+
+        Enabling the name clears the name-level flag and every per-version flag of
+        that name. Enabling one version clears only that version's own flag, so it
+        stays disabled while the name is disabled. Emits one ``enabled`` event.
+        """
         self._set_enabled(name, version, enabled=True)
 
     def _set_enabled(self, name: str, version: str | None, *, enabled: bool) -> None:
@@ -81,7 +91,7 @@ class ToolRegistry:
             if version is None:
                 if enabled:
                     self._disabled_names.discard(name)
-                    self._disabled.discard(spec.key)
+                    self._disabled = {key for key in self._disabled if key[0] != name}
                 else:
                     self._disabled_names.add(name)
             elif enabled:
@@ -105,13 +115,12 @@ class ToolRegistry:
             return max(versions.values(), key=lambda s: s.version_tuple)
 
     def is_enabled(self, name: str, version: str | None = None) -> bool:
+        """Whether that version (default: the latest) and its tool name are both enabled."""
         with self._lock:
             return self._enabled(self.get(name, version))
 
     def _enabled(self, spec: ToolSpec) -> bool:
-        if spec.key in self._disabled:
-            return False
-        return spec.name not in self._disabled_names or spec.key != self.get(spec.name).key
+        return spec.key not in self._disabled and spec.name not in self._disabled_names
 
     def list(self, *, include_disabled: bool = True) -> list[ToolSpec]:
         """Latest version of every tool name, sorted by name."""
@@ -170,7 +179,7 @@ class ToolRegistry:
         for listener in listeners:
             try:
                 listener(event)
-            except Exception:  # noqa: BLE001 - listeners must never break the registry
+            except Exception:
                 logger.exception("registry listener failed for %s", event)
 
 

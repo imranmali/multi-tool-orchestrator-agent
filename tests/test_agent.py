@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -406,7 +407,9 @@ class TestPlanExecution:
             return f"{x}+{y}"
 
         orch = make_orch(
-            make("ping", ("p",), fn=ping), make("pong", ("p",), fn=pong), make("join", ("j",), fn=join)
+            make("ping", ("p",), fn=ping),
+            make("pong", ("p",), fn=pong),
+            make("join", ("j",), fn=join),
         )
         plan = Plan(
             [
@@ -1514,3 +1517,289 @@ class TestAdversarial:
         report = await orch.run([Step("s", tool="t")], USER)
         assert "upstream API timed out" in report["s"].error
         assert [a.outcome for a in report.attempts["s"]] == ["error"]
+
+
+# ---------------------------------------------------------------------------
+# lift-design-limits: availability and resource claims re-checked at invocation
+# ---------------------------------------------------------------------------
+
+
+def disable_when_routed(holder: dict[str, Orchestrator], tool: str):
+    """An event listener disabling ``tool`` as soon as it is routed to a step."""
+
+    def listener(event: OrchestratorEvent) -> None:
+        if event.kind == "routed" and event.tool == tool:
+            holder["orch"].registry.disable(tool)
+
+    return listener
+
+
+class TestAvailabilityAtInvocation:
+    async def test_pinned_version_of_disabled_tool(self):
+        calls: list[str] = []
+        orch = make_orch(
+            make("calc", ("calc",), version="1.0.0", calls=calls),
+            make("calc", ("calc",), version="2.0.0", calls=calls),
+        )
+        orch.registry.disable("calc")
+        report = await orch.run([Step("s", tool="calc", version="1.0.0")], USER)
+        assert report.failed == ["s"]
+        assert isinstance(report["s"].exception, ExecutionError)
+        assert "calc@1.0.0 is disabled" in report["s"].error
+        assert calls == []
+        assert [(a.tool, a.version, a.outcome) for a in report.attempts["s"]] == [
+            ("calc", "1.0.0", "unavailable")
+        ]
+        assert report.audit == ()
+        assert [i.kind for i in report.issues] == ["disabled"]
+
+    async def test_disabled_tool_records_unavailable_attempt(self):
+        orch = make_orch(make("calc", ("calc",)))
+        orch.registry.disable("calc")
+        report = await orch.run([Step("s", tool="calc")], USER)
+        assert [a.outcome for a in report.attempts["s"]] == ["unavailable"]
+        assert "routed" not in [e.kind for e in report.events]
+
+    async def test_named_tool_disabled_once_routed(self):
+        calls: list[str] = []
+        holder: dict[str, Orchestrator] = {}
+        orch = make_orch(
+            make("calc", ("calc",), calls=calls), on_event=disable_when_routed(holder, "calc")
+        )
+        holder["orch"] = orch
+        report = await orch.run([Step("s", tool="calc")], USER)
+        assert report.failed == ["s"]
+        assert isinstance(report["s"].exception, ExecutionError)
+        assert "is disabled" in report["s"].error
+        assert calls == []
+        assert [(a.tool, a.outcome) for a in report.attempts["s"]] == [("calc", "unavailable")]
+        assert report.audit == ()  # never authorized
+        assert orch.router.stats("calc").calls == 0
+
+    async def test_named_tool_replaced_once_routed(self):
+        calls: list[str] = []
+        orch: Orchestrator
+
+        def listener(event: OrchestratorEvent) -> None:
+            if event.kind == "routed":
+                orch.register(make("calc", ("calc",), value="new", calls=calls), replace=True)
+
+        orch = make_orch(make("calc", ("calc",), calls=calls), on_event=listener)
+        report = await orch.run([Step("s", tool="calc")], USER)
+        assert report.failed == ["s"] and "was replaced" in report["s"].error
+        assert calls == []
+        assert [a.outcome for a in report.attempts["s"]] == ["unavailable"]
+
+    async def test_unavailable_candidate_skipped_without_budget(self):
+        calls: list[str] = []
+        holder: dict[str, Orchestrator] = {}
+        orch = make_orch(
+            make("alpha", priority=9, calls=calls),
+            make("beta", priority=1, calls=calls),
+            max_fallbacks=0,
+            on_event=disable_when_routed(holder, "alpha"),
+        )
+        holder["orch"] = orch
+        report = await orch.run([Step("s", capability="search")], USER)
+        assert report.ok and report.served_by["s"] == ("beta",)
+        assert calls == ["beta"]
+        assert [(a.tool, a.outcome) for a in report.attempts["s"]] == [
+            ("alpha", "unavailable"),
+            ("beta", "ok"),
+        ]
+        assert orch.router.stats("alpha").calls == 0
+        assert "fallback" not in [e.kind for e in report.events]
+        assert [r.tool for r in report.audit] == ["beta"]
+
+    async def test_only_candidate_unavailable_is_no_route(self):
+        holder: dict[str, Orchestrator] = {}
+        orch = make_orch(make("alpha"), on_event=disable_when_routed(holder, "alpha"))
+        holder["orch"] = orch
+        report = await orch.run([Step("s", capability="search")], USER)
+        assert report.failed == ["s"]
+        assert isinstance(report["s"].exception, NoRouteError)
+        assert [a.outcome for a in report.attempts["s"]] == ["unavailable"]
+
+    async def test_unavailable_after_invoked_candidate_exhausts(self):
+        holder: dict[str, Orchestrator] = {}
+        orch = make_orch(
+            make("first", priority=9, fn=boom),
+            make("second", priority=1),
+            on_event=disable_when_routed(holder, "second"),
+        )
+        holder["orch"] = orch
+        report = await orch.run([Step("s", capability="search")], USER)
+        exc = report["s"].exception
+        assert isinstance(exc, FallbackExhaustedError)
+        assert [(a.tool, a.outcome) for a in exc.attempts] == [
+            ("first", "error"),
+            ("second", "unavailable"),
+        ]
+
+    async def test_fallback_candidate_disabled_mid_step(self):
+        calls: list[str] = []
+        orch: Orchestrator
+
+        async def disable_then_fail(**_: Any) -> Any:
+            orch.registry.disable("second")
+            raise RuntimeError("first failed")
+
+        orch = make_orch(
+            make("first", priority=9, fn=disable_then_fail, calls=calls),
+            make("second", priority=5, calls=calls),
+            make("third", priority=1, calls=calls),
+        )
+        report = await orch.run([Step("s", capability="search")], USER)
+        assert report.ok and report.served_by["s"] == ("third",)
+        assert calls == ["first", "third"]
+        assert report.chains["s"] == ("first", "third")
+
+    async def test_fanout_member_disabled_mid_run(self):
+        calls: list[str] = []
+        orch: Orchestrator
+
+        async def disable_c(**_: Any) -> str:
+            orch.registry.disable("c")
+            await asyncio.sleep(0)
+            return "A"
+
+        orch = make_orch(
+            make("a", priority=3, fn=disable_c, calls=calls),
+            make("b", priority=2, value="A", calls=calls),
+            make("c", priority=1, value="B", calls=calls),
+        )
+        report = await orch.run(
+            [Step("s", capability="search")], USER, fanout={"s": FanOut(3, "majority")}
+        )
+        assert report.ok and report.outputs["s"] == "A"
+        assert "c" not in calls
+        resolution = report.resolutions["s"]
+        assert set(resolution.winners) == {"a", "b"} and "c" not in resolution.winners
+        outcomes = {a.tool: a.outcome for a in report.attempts["s"]}
+        assert outcomes == {"a": "ok", "b": "ok", "c": "unavailable"}
+        assert orch.router.stats("c").calls == 0
+        assert {r.tool for r in report.audit} == {"a", "b"}
+
+    async def test_fanout_member_replaced_mid_run(self):
+        calls: list[str] = []
+        orch: Orchestrator
+
+        async def replace_b(**_: Any) -> str:
+            orch.register(make("b", priority=2, value="X", calls=calls), replace=True)
+            return "A"
+
+        orch = make_orch(
+            make("a", priority=3, fn=replace_b, calls=calls),
+            make("b", priority=2, value="A", calls=calls),
+            make("c", priority=1, value="A", calls=calls),
+        )
+        report = await orch.run(
+            [Step("s", capability="search")], USER, fanout={"s": FanOut(3, "majority")}
+        )
+        assert report.ok and report.outputs["s"] == "A"
+        assert calls == ["a", "c"]
+        assert {a.tool: a.outcome for a in report.attempts["s"]}["b"] == "unavailable"
+
+    async def test_every_fanout_member_unavailable_fails(self):
+        orch: Orchestrator
+
+        def listener(event: OrchestratorEvent) -> None:
+            if event.kind == "routed" and event.tool is not None:
+                orch.registry.disable(event.tool)
+
+        orch = make_orch(make("a", priority=2), make("b", priority=1), on_event=listener)
+        report = await orch.run(
+            [Step("s", capability="search")], USER, fanout={"s": FanOut(2, "majority")}
+        )
+        assert report.failed == ["s"]
+        assert isinstance(report["s"].exception, ConflictError)
+        assert [a.outcome for a in report.attempts["s"]] == ["unavailable", "unavailable"]
+
+
+class TestClaimsAtInvocation:
+    def _replacing_plan(self, orch_ref: dict[str, Orchestrator], replacement: ToolSpec):
+        async def replace(**_: Any) -> str:
+            orch_ref["orch"].register(replacement, replace=True)
+            return "replaced"
+
+        return make("setup", ("setup",), fn=replace), [
+            Step("a", tool="setup"),
+            Step("b", tool="report", depends_on=("a",)),
+        ]
+
+    async def test_tool_replaced_with_new_claim(self):
+        calls: list[str] = []
+        holder: dict[str, Orchestrator] = {}
+        replacement = make(
+            "report", ("report",), value="new", calls=calls,
+            metadata={"resources": {"db": "write"}},
+        )
+        setup, plan = self._replacing_plan(holder, replacement)
+        orch = make_orch(setup, make("report", ("report",), calls=calls))
+        holder["orch"] = orch
+        report = await orch.run(plan, USER)
+        assert report.succeeded == ["a"] and report.failed == ["b"]
+        assert isinstance(report["b"].exception, ExecutionError)
+        assert "claims changed" in report["b"].error and "'db'" in report["b"].error
+        assert calls == []
+        assert [(a.tool, a.outcome) for a in report.attempts["b"]] == [
+            ("report", "claims_changed")
+        ]
+        assert "routed" not in [e.kind for e in report.events if e.step_id == "b"]
+
+    async def test_covered_claims_still_run(self):
+        calls: list[str] = []
+        holder: dict[str, Orchestrator] = {}
+        replacement = make(
+            "report", ("report",), value="new", calls=calls,
+            metadata={"resources": {"db": "read"}},
+        )
+        setup, plan = self._replacing_plan(holder, replacement)
+        orch = make_orch(
+            setup,
+            make("report", ("report",), value="old", metadata={"resources": {"db": "write"}}),
+        )
+        holder["orch"] = orch
+        report = await orch.run(plan, USER)
+        assert report.ok and report.outputs["b"] == "new"
+        assert calls == ["report"]
+
+    async def test_step_own_claim_covers_new_tool_claim(self):
+        holder: dict[str, Orchestrator] = {}
+        replacement = make(
+            "report", ("report",), value="new", metadata={"resources": {"db": "write"}}
+        )
+        setup, plan = self._replacing_plan(holder, replacement)
+        plan[1] = dataclasses.replace(plan[1], resources={"db": "read"})  # step claim wins
+        orch = make_orch(setup, make("report", ("report",)))
+        holder["orch"] = orch
+        report = await orch.run(plan, USER)
+        assert report.ok and report.outputs["b"] == "new"
+
+    async def test_newer_version_with_new_claim(self):
+        holder: dict[str, Orchestrator] = {}
+        newer = make(
+            "report", ("report",), version="2.0.0", metadata={"resources": {"db": "write"}}
+        )
+        setup, plan = self._replacing_plan(holder, newer)
+        orch = make_orch(setup, make("report", ("report",)))
+        holder["orch"] = orch
+        report = await orch.run(plan, USER)
+        assert report.failed == ["b"]
+        assert [(a.version, a.outcome) for a in report.attempts["b"]] == [
+            ("2.0.0", "claims_changed")
+        ]
+
+    async def test_malformed_replacement_claims_fail_attempt(self):
+        holder: dict[str, Orchestrator] = {}
+        replacement = make("report", ("report",), metadata={"resources": ["db"]})
+        setup, plan = self._replacing_plan(holder, replacement)
+        orch = make_orch(setup, make("report", ("report",)))
+        holder["orch"] = orch
+        report = await orch.run(plan, USER)
+        assert report.failed == ["b"]
+        assert isinstance(report["b"].exception, ExecutionError)
+        assert [a.outcome for a in report.attempts["b"]] == ["claims_changed"]
+
+    def test_new_outcomes_listed(self):
+        assert {"unavailable", "claims_changed"} <= agent_mod.ATTEMPT_OUTCOMES

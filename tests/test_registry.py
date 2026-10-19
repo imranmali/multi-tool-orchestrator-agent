@@ -152,3 +152,115 @@ def test_newline_suffixed_version_cannot_dodge_duplicate_check(tool_factory):
     with pytest.raises(ValidationError):
         reg.register(tool_factory("calc", "1.0.0\n"))
     assert reg.versions("calc") == ["1.0.0"]
+
+
+# -- lift-design-limits: name-level disablement covers every version ----------
+
+
+def test_name_disable_covers_pinned_older_version(tool_factory):
+    reg = ToolRegistry()
+    old = reg.register(tool_factory("calc", "1.0.0", caps=("math",)))
+    reg.register(tool_factory("calc", "2.0.0", caps=("math",)))
+    reg.disable("calc")
+    assert not reg.is_enabled("calc", "1.0.0")
+    assert not reg.is_enabled("calc", "2.0.0")
+    assert not reg.is_enabled("calc")
+    assert reg.get("calc", "1.0.0") is old  # still retrievable
+    assert reg.find_by_capability("math") == []
+
+
+def test_name_disable_covers_later_version(tool_factory):
+    reg = ToolRegistry()
+    reg.register(tool_factory("calc", "1.0.0", caps=("math",)))
+    reg.disable("calc")
+    reg.register(tool_factory("calc", "3.0.0", caps=("math",)))
+    assert not reg.is_enabled("calc", "3.0.0")
+    assert not reg.is_enabled("calc", "1.0.0")
+    assert reg.find_by_capability("math") == []
+    assert reg.capabilities() == set()
+
+
+def test_version_disable_leaves_other_versions_enabled(tool_factory):
+    reg = ToolRegistry()
+    reg.register(tool_factory("calc", "1.0.0", caps=("math",)))
+    reg.register(tool_factory("calc", "2.0.0", caps=("math",)))
+    reg.disable("calc", "1.0.0")
+    assert not reg.is_enabled("calc", "1.0.0")
+    assert reg.is_enabled("calc", "2.0.0")
+    assert [s.version for s in reg.find_by_capability("math")] == ["2.0.0"]
+
+
+def test_version_enable_does_not_override_name_disable(tool_factory):
+    reg = ToolRegistry()
+    reg.register(tool_factory("calc", "1.0.0", caps=("math",)))
+    reg.register(tool_factory("calc", "2.0.0", caps=("math",)))
+    reg.disable("calc")
+    reg.enable("calc", "1.0.0")
+    assert not reg.is_enabled("calc", "1.0.0")
+    assert not reg.is_enabled("calc", "2.0.0")
+    reg.enable("calc")
+    assert reg.is_enabled("calc", "1.0.0") and reg.is_enabled("calc", "2.0.0")
+
+
+def test_name_enable_clears_every_version_flag(tool_factory):
+    reg = ToolRegistry()
+    reg.register(tool_factory("calc", "1.0.0", caps=("math",)))
+    reg.register(tool_factory("calc", "2.0.0", caps=("math",)))
+    reg.register(tool_factory("other", "1.0.0", caps=("math",)))
+    reg.disable("calc", "1.0.0")
+    reg.disable("calc", "2.0.0")
+    reg.disable("other", "1.0.0")
+    reg.disable("calc")
+    reg.enable("calc")
+    assert reg.is_enabled("calc", "1.0.0") and reg.is_enabled("calc", "2.0.0")
+    assert not reg.is_enabled("other", "1.0.0")  # other names keep their flags
+
+
+def test_full_unregister_forgets_name_and_version_flags(tool_factory):
+    reg = ToolRegistry()
+    reg.register(tool_factory("calc", "1.0.0", caps=("math",)))
+    reg.disable("calc", "1.0.0")
+    reg.disable("calc")
+    reg.unregister("calc")
+    reg.register(tool_factory("calc", "1.0.0", caps=("math",)))
+    assert reg.is_enabled("calc", "1.0.0")
+
+
+def test_whole_tool_toggle_emits_one_event_naming_latest(tool_factory):
+    reg = ToolRegistry()
+    reg.register(tool_factory("calc", "1.0.0"))
+    reg.register(tool_factory("calc", "2.0.0"))
+    events: list[RegistryEvent] = []
+    reg.subscribe(events.append)
+    reg.disable("calc")
+    reg.enable("calc")
+    reg.disable("calc", "1.0.0")
+    reg.enable("calc", "1.0.0")
+    assert events == [
+        RegistryEvent("disabled", "calc", "2.0.0"),
+        RegistryEvent("enabled", "calc", "2.0.0"),
+        RegistryEvent("disabled", "calc", "1.0.0"),
+        RegistryEvent("enabled", "calc", "1.0.0"),
+    ]
+
+
+async def test_default_invoker_refuses_pinned_version_of_disabled_name(tool_factory):
+    from orchestrator import ExecutionError, ParallelExecutor, Plan, Step, default_invoker
+
+    reg = ToolRegistry()
+    calls: list[str] = []
+
+    async def handler(**kwargs):
+        calls.append("1.0.0")
+        return "v1"
+
+    reg.register(tool_factory("calc", "1.0.0", handler=handler))
+    reg.register(tool_factory("calc", "2.0.0"))
+    reg.disable("calc")
+    report = await ParallelExecutor(default_invoker(reg)).run(
+        Plan([Step("a", tool="calc", version="1.0.0")])
+    )
+    assert report["a"].status == "failed"
+    assert isinstance(report["a"].exception, ExecutionError)
+    assert "calc@1.0.0 is disabled" in report["a"].error
+    assert calls == []
