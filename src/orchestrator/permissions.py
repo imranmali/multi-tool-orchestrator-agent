@@ -47,7 +47,8 @@ __all__ = [
     "validate_scope",
 ]
 
-_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# Applied with ``fullmatch``: ``$`` would also accept a trailing newline.
+_SEGMENT_RE = re.compile(r"[A-Za-z0-9_.-]+")
 WILDCARD = "*"
 
 
@@ -74,7 +75,7 @@ def validate_scope(scope: str, *, allow_wildcard: bool = True) -> str:
             continue
         if not segment:
             raise ValidationError(f"invalid scope {scope!r}: empty segment")
-        if not _SEGMENT_RE.match(segment):
+        if not _SEGMENT_RE.fullmatch(segment):
             raise ValidationError(
                 f"invalid scope {scope!r}: segment {segment!r} must match [A-Za-z0-9_.-]+"
             )
@@ -224,10 +225,13 @@ class Principal:
     def narrow(self, scopes: Iterable[str], *, id: str | None = None) -> Principal:
         """Delegate a subset of this principal's *own* scopes to a new child principal.
 
-        Raises :class:`AccessDeniedError` if any requested scope is not covered.
-        Use :meth:`PermissionPolicy.delegate` to delegate role-granted scopes too.
+        Raises :class:`AccessDeniedError` if any requested scope is not covered by
+        :attr:`scopes`. Use :meth:`PermissionPolicy.delegate` to delegate role-granted
+        scopes too. Ancestors are not consulted here: the child's effective authority
+        is still bounded by every delegating ancestor's *effective* scopes (roles
+        included) when access is decided, see :meth:`PermissionPolicy.effective_scopes`.
         """
-        return _make_child(self, scopes, self.delegable_scopes, id)
+        return _make_child(self, scopes, self.scopes, id)
 
 
 def _make_child(

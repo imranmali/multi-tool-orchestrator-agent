@@ -722,3 +722,118 @@ def test_module_imports_only_core_and_stdlib():
         elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("orchestrator"):
             local.add(node.module)
     assert local <= {"core", "orchestrator.core"}
+
+
+# --------------------------------------------------------------------------- audit regressions
+
+
+def test_majority_int_and_str_keys_differ(resolver):
+    res = resolver.resolve([ok("a", {1: "x"}), ok("b", {"1": "x"}), ok("c", {1: "x"})], "majority")
+    assert res.value == {1: "x"}
+    assert res.winners == ("a", "c")
+    assert res.dissenters == ("b",)
+
+
+def test_majority_list_and_tuple_differ(resolver):
+    res = resolver.resolve([ok("a", [1, 2]), ok("b", (1, 2)), ok("c", [1, 2])], "majority")
+    assert res.winners == ("a", "c")
+
+
+def test_majority_repr_string_is_not_the_object(resolver):
+    res = resolver.resolve([ok("a", "Ellipsis"), ok("b", ...), ok("c", "Ellipsis")], "majority")
+    assert res.value == "Ellipsis"
+    assert res.dissenters == ("b",)
+
+
+def test_majority_int_equals_float(resolver):
+    res = resolver.resolve([ok("a", 42), ok("b", 42.0)], "majority")
+    assert res.winners == ("a", "b")
+    assert res.confidence == 1.0
+
+
+def test_majority_bool_is_not_int(resolver):
+    res = resolver.resolve([ok("a", 1), ok("b", True), ok("c", 1)], "majority")
+    assert res.winners == ("a", "c")
+    assert res.dissenters == ("b",)
+
+
+def test_majority_nested_structural_equality(resolver):
+    a = {"k": [1, {"z": 2.0, "y": (3,)}], "n": None}
+    b = {"n": None, "k": [1.0, {"y": (3,), "z": 2}]}
+    res = resolver.resolve([ok("a", a), ok("b", b)], "majority")
+    assert res.winners == ("a", "b")
+
+
+def test_merge_int_and_float_leaves_are_equal(resolver):
+    res = resolver.resolve([ok("a", {"n": 1}), ok("b", {"n": 1.0})], "merge")
+    assert res.value == {"n": 1}
+    assert res.details["conflicts"] == []
+
+
+def test_merge_int_and_str_keys_stay_distinct(resolver):
+    res = resolver.resolve([ok("a", {"m": {1: "x"}}), ok("b", {"m": {"1": "y"}})], "merge")
+    assert res.value == {"m": {1: "x", "1": "y"}}
+    assert res.details["conflicts"] == []
+
+
+def test_merge_list_union_distinguishes_list_and_tuple(resolver):
+    res = resolver.resolve([ok("a", {"l": [[1], (1,)]}), ok("b", {"l": [(1,), [1]]})], "merge")
+    assert res.value == {"l": [[1], (1,)]}
+
+
+def test_numeric_infinite_value_is_conflict(resolver):
+    with pytest.raises(ConflictError, match="non-finite"):
+        resolver.resolve([ok("a", 1), ok("b", float("inf"))], "numeric")
+    with pytest.raises(ConflictError):
+        resolver.resolve([ok("a", float("nan")), ok("b", 1)], "numeric")
+
+
+@pytest.mark.parametrize("agg", ["mean", "median"])
+def test_numeric_huge_ints_overflow_is_conflict(resolver, agg):
+    with pytest.raises(ConflictError):
+        resolver.resolve([ok("a", 10**400), ok("b", 1)], "numeric", agg=agg)
+
+
+def test_numeric_huge_int_mixed_with_float_is_conflict(resolver):
+    with pytest.raises(ConflictError):
+        resolver.resolve([ok("a", 10**400), ok("b", 1.5)], "numeric", agg="max")
+
+
+def test_numeric_huge_equal_ints(resolver):
+    res = resolver.resolve([ok("a", 10**400), ok("b", 10**400)], "numeric")
+    assert res.value == 10**400
+    assert res.confidence == 1.0
+
+
+def test_numeric_int_mean_is_exact(resolver):
+    big = 10**17
+    res = resolver.resolve([ok("a", big + 1), ok("b", big + 3)], "numeric")
+    assert res.value == big + 2
+
+
+def test_numeric_nearly_equal_values_below_full_confidence(resolver):
+    res = resolver.resolve([ok("a", 1e18), ok("b", 1e18 + 256)], "numeric")
+    assert 0.0 <= res.confidence < 1.0
+
+
+def test_majority_name_tie_uses_smallest_name_in_group(resolver):
+    res = resolver.resolve(
+        [
+            ok("m", "X", priority=5),
+            ok("a", "X", priority=0),
+            ok("b", "Y", priority=5),
+            ok("y", "Y", priority=0),
+        ],
+        "majority",
+    )
+    assert res.value == "X"
+    assert res.winners == ("m", "a")
+    assert res.details["tie_broken"] is True
+
+
+def test_majority_priority_tie_break_still_precedes_name(resolver):
+    res = resolver.resolve(
+        [ok("a", "X", priority=0), ok("z", "Y", priority=9), ok("b", "X", priority=0), ok("c", "Y")],
+        "majority",
+    )
+    assert res.value == "Y"

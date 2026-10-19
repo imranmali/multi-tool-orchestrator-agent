@@ -13,7 +13,6 @@ This module depends only on :mod:`orchestrator.core` and the standard library.
 from __future__ import annotations
 
 import asyncio
-import json
 import math
 import statistics
 from collections import deque
@@ -36,26 +35,48 @@ StrategyFn = Callable[..., Any]
 
 _MISSING = object()
 
-
-def _canonical(value: Any) -> str | None:
-    """Order-insensitive canonical form of a JSON-like value, or None if unserialisable."""
-    try:
-        return json.dumps(value, sort_keys=True, default=repr)
-    except (TypeError, ValueError):
-        return None
+_SCALARS = (str, bytes, bytearray)
 
 
-def _same(a: Any, b: Any, ka: Any = _MISSING, kb: Any = _MISSING) -> bool:
-    """Structural equality: canonical JSON when available, falling back to ``==``."""
-    if ka is _MISSING:
-        ka = _canonical(a)
-    if kb is _MISSING:
-        kb = _canonical(b)
-    if ka is not None and kb is not None:
-        return ka == kb
+def _same(a: Any, b: Any) -> bool:
+    """Type-aware recursive structural equality.
+
+    * mappings are equal when they have the same keys (compared structurally,
+      so ``1`` and ``"1"`` differ) mapping to structurally equal values; key
+      order is irrelevant;
+    * lists equal lists and tuples equal tuples, element-wise; a list never
+      equals a tuple;
+    * booleans only equal booleans; other numbers compare like ``==`` (so
+      ``1 == 1.0``), and NaN equals NaN so identical NaN results group together;
+    * strings and bytes compare with ``==`` (never equal to other types);
+    * anything else falls back to ``==`` (an exception or non-bool answer that
+      cannot be interpreted means "different").
+    """
+    if a is b:
+        return True
+    if isinstance(a, Mapping) or isinstance(b, Mapping):
+        if not (isinstance(a, Mapping) and isinstance(b, Mapping)) or len(a) != len(b):
+            return False
+        b_keys = {k: k for k in b}
+        for ka, va in a.items():
+            kb = b_keys.get(ka, _MISSING)
+            if kb is _MISSING or not _same(ka, kb) or not _same(va, b[kb]):
+                return False
+        return True
+    for kind in (list, tuple):
+        if isinstance(a, kind) or isinstance(b, kind):
+            if not (isinstance(a, kind) and isinstance(b, kind)) or len(a) != len(b):
+                return False
+            return all(_same(x, y) for x, y in zip(a, b))
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if isinstance(a, _SCALARS) or isinstance(b, _SCALARS):
+        return type(a) is type(b) and a == b
+    if isinstance(a, float) and isinstance(b, float) and math.isnan(a) and math.isnan(b):
+        return True
     try:
         return bool(a == b)
-    except Exception:  # pragma: no cover - exotic __eq__
+    except Exception:  # noqa: BLE001 - exotic __eq__ / ambiguous truth value
         return False
 
 
@@ -182,8 +203,7 @@ class ConflictResolver:
         participants: Sequence[ToolResult],
         details: Mapping[str, Any] | None = None,
     ) -> Resolution:
-        key = _canonical(value)
-        winners = tuple(r.tool for r in participants if _same(r.value, value, kb=key))
+        winners = tuple(r.tool for r in participants if _same(r.value, value))
         dissenters = tuple(r.tool for r in participants if r.tool not in winners)
         return Resolution(
             value=value,
@@ -234,27 +254,28 @@ class ConflictResolver:
             ):
                 raise ValidationError(f"quorum must be in (0, 1], got {quorum!r}")
 
-        groups: list[tuple[Any, str | None, list[ToolResult]]] = []
+        groups: list[tuple[Any, list[ToolResult]]] = []
         for result in results:
-            key = _canonical(result.value)
-            for value, gkey, members in groups:
-                if _same(result.value, value, ka=key, kb=gkey):
+            for value, members in groups:
+                if _same(result.value, value):
                     members.append(result)
                     break
             else:
-                groups.append((result.value, key, [result]))
+                groups.append((result.value, [result]))
 
-        def group_rank(group: tuple[Any, str | None, list[ToolResult]]) -> tuple[int, int, str]:
-            members = group[2]
-            top = min(members, key=self._rank)
-            return (-len(members), -self.priority_of(top), top.tool)
+        def group_rank(group: tuple[Any, list[ToolResult]]) -> tuple[int, int, str]:
+            # Largest group, then the group containing the highest-priority tool,
+            # then the group containing the alphabetically smallest tool name.
+            members = group[1]
+            top_priority = max(self.priority_of(r) for r in members)
+            return (-len(members), -top_priority, min(r.tool for r in members))
 
         ordered = sorted(groups, key=group_rank)
-        value, _, members = ordered[0]
+        value, members = ordered[0]
         share = len(members) / len(results)
-        tied = len(ordered) > 1 and len(ordered[1][2]) == len(members)
+        tied = len(ordered) > 1 and len(ordered[1][1]) == len(members)
         details = {
-            "groups": [[r.tool for r in g[2]] for g in ordered],
+            "groups": [[r.tool for r in g[1]] for g in ordered],
             "tie_broken": tied,
             "quorum": quorum,
         }
@@ -300,18 +321,12 @@ class ConflictResolver:
                 }
             if all(isinstance(v, list) for v in vals):
                 merged: list[Any] = []
-                seen: list[str | None] = []
                 for v in vals:
                     for item in v:
-                        ikey = _canonical(item)
-                        if not any(
-                            _same(item, m, ka=ikey, kb=mk) for m, mk in zip(merged, seen)
-                        ):
+                        if not any(_same(item, m) for m in merged):
                             merged.append(item)
-                            seen.append(ikey)
                 return merged
-            first_key = _canonical(vals[0])
-            if all(_same(vals[0], v, ka=first_key) for v in vals[1:]):
+            if all(_same(vals[0], v) for v in vals[1:]):
                 return vals[0]
             # Genuine conflict at this path.
             if on_conflict == "first":
@@ -320,9 +335,8 @@ class ConflictResolver:
                 chosen_result, chosen = min(contribs, key=lambda rv: self._rank(rv[0]))
             else:
                 chosen_result, chosen = contribs[0]  # placeholder; error raised later
-            ckey = _canonical(chosen)
             for r, v in contribs:
-                if not _same(v, chosen, kb=ckey):
+                if not _same(v, chosen):
                     dissenters.add(r.tool)
             conflicts.append(
                 {
@@ -358,7 +372,7 @@ class ConflictResolver:
     def _numeric(self, results: Sequence[ToolResult], agg: str = "mean", **options: Any) -> Resolution:
         self._check_options("numeric", options, ("agg",))
         aggregators: dict[str, Callable[[list[float]], float]] = {
-            "mean": statistics.fmean,
+            "mean": _mean,
             "median": statistics.median,
             "min": min,
             "max": max,
@@ -368,20 +382,36 @@ class ConflictResolver:
         bad = [
             r.tool
             for r in results
-            if isinstance(r.value, bool)
-            or not isinstance(r.value, (int, float))
-            or (isinstance(r.value, float) and math.isnan(r.value))
+            if isinstance(r.value, bool) or not isinstance(r.value, (int, float))
         ]
         if bad:
             raise ConflictError(f"numeric strategy got non-numeric values from {', '.join(bad)}")
+        non_finite = [
+            r.tool for r in results if isinstance(r.value, float) and not math.isfinite(r.value)
+        ]
+        if non_finite:
+            raise ConflictError(
+                f"numeric strategy got non-finite values (inf/NaN) from {', '.join(non_finite)}"
+            )
         nums = [r.value for r in results]
-        value = aggregators[agg](nums)
+        try:
+            value = aggregators[agg](nums)
+        except OverflowError as exc:
+            raise ConflictError(f"numeric {agg} of {nums!r} overflowed: {exc}") from None
         if isinstance(value, float) and value.is_integer() and all(isinstance(n, int) for n in nums):
             value = int(value)
         low, high = min(nums), max(nums)
-        spread = high - low
-        scale = max(abs(low), abs(high))
-        confidence = 1.0 if spread == 0 else max(0.0, min(1.0, 1 - spread / scale)) if scale else 1.0
+        try:
+            spread = high - low
+            ratio = spread / max(abs(low), abs(high)) if spread else 0.0
+        except OverflowError as exc:  # e.g. a huge int mixed with a float
+            raise ConflictError(f"numeric spread of {nums!r} overflowed: {exc}") from None
+        if spread == 0:
+            confidence = 1.0
+        else:
+            confidence = 0.0 if math.isnan(ratio) else max(0.0, min(1.0, 1 - ratio))
+            # Values differ, so confidence must stay strictly below 1.0.
+            confidence = min(confidence, math.nextafter(1.0, 0.0))
         return Resolution(
             value=value,
             strategy="numeric",
@@ -390,6 +420,13 @@ class ConflictResolver:
             confidence=confidence,
             details={"agg": agg, "values": {r.tool: r.value for r in results}, "spread": spread},
         )
+
+
+def _mean(nums: list[float]) -> float:
+    """Exact mean for ints (no float precision loss), ``fmean`` otherwise."""
+    if all(isinstance(n, int) for n in nums):
+        return statistics.mean(nums)
+    return statistics.fmean(nums)
 
 
 # --------------------------------------------------------------------------- resource locks

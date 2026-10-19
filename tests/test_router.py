@@ -498,3 +498,41 @@ def test_concurrent_recording_is_exact(registry):
     st = router.stats("a")
     assert st.successes == st.failures == n_threads * per_thread // 2
     assert st.avg_latency == 1.0
+
+
+# -- regression tests from the spec audit -------------------------------------
+
+
+def test_failure_while_open_does_not_extend_cooldown(registry, router, clock):
+    add(registry, "a")
+    _open(router, clock, at=2.0)
+    clock.now = 20.0
+    router.record_failure("a")  # straggler from an in-flight call
+    assert router.circuit_state("a") == OPEN
+    assert router.stats("a").failures == 4
+    clock.now = 31.9
+    assert router.candidates("search") == []
+    clock.now = 32.0
+    assert router.circuit_state("a") == HALF_OPEN
+    assert names(router.candidates("search")) == ["a"]
+
+
+def test_infinite_cost_never_yields_nan_score(registry, router):
+    registry.register(make_tool("a", caps=(cap(cost=float("inf"), priority=0),)))
+    registry.register(make_tool("b", caps=(cap(cost=1.0, priority=5),)))
+    explained = router.explain("search")
+    assert [e.tool for e in explained] == ["b", "a"]
+    assert all(e.score == e.score for e in explained)  # no NaN
+    assert names(router.candidates("search", strategy="cheapest")) == ["b", "a"]
+
+
+def test_infinite_latency_ranks_slowest(registry, router):
+    registry.register(make_tool("a", caps=(cap(latency=float("inf")),)))
+    registry.register(make_tool("b", caps=(cap(latency=5.0),)))
+    assert names(router.candidates("search", strategy="fastest")) == ["b", "a"]
+    assert names(router.candidates("search", strategy="balanced")) == ["b", "a"]
+
+
+def test_nan_cost_rejected_at_declaration():
+    with pytest.raises(ValidationError):
+        cap(cost=float("nan"))

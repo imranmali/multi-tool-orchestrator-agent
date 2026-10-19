@@ -480,3 +480,39 @@ def test_concurrent_decisions():
     log = policy.audit_log
     assert len(log) == 400
     assert all(r.allowed for r in log)
+
+
+# --------------------------------------------------------------- audit regressions
+
+
+def test_policy_delegated_child_can_narrow_its_own_scopes():
+    policy = PermissionPolicy({"reader": ["fs:read"]})
+    parent = Principal("p", roles={"reader"})
+    child = policy.delegate(parent, ["fs:read"], id="child")
+    assert child.scopes == frozenset({"fs:read"})
+    grandchild = child.narrow(["fs:read"], id="grandchild")
+    assert grandchild.scopes == frozenset({"fs:read"})
+    assert grandchild.parent is child
+    assert policy.effective_scopes(grandchild) == frozenset({"fs:read"})
+    assert policy.allowed(grandchild, make_tool("reader", scopes=["fs:read"]))
+
+
+def test_narrow_checks_own_scopes_and_effective_authority_stays_bounded():
+    policy = PermissionPolicy()
+    parent = Principal("p", scopes={"fs:read"})
+    child = Principal("c", scopes={"*"}, parent=parent)
+    # Direct delegation is checked against the delegator's own scopes ...
+    grandchild = child.narrow(["fs:write"], id="g")
+    # ... while decisions are still bounded by every ancestor's effective scopes.
+    assert policy.effective_scopes(grandchild) == frozenset()
+    assert not policy.allowed(grandchild, make_tool("w", scopes=["fs:write"]))
+    with pytest.raises(PermissionDeniedError, match="not held by 'p'"):
+        parent.narrow(["fs:write"])
+
+
+@pytest.mark.parametrize("scope", ["fs:read\n", "fs\n:read", "fs:r١"])
+def test_scope_segments_must_fully_match(scope):
+    with pytest.raises(ValidationError):
+        validate_scope(scope)
+    with pytest.raises(ValidationError):
+        Principal("p", scopes={scope})

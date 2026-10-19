@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import (
@@ -113,8 +114,12 @@ def _lookup(value: Any, segment: str, ref: Ref) -> Any:
     )
 
 
+_INT_SEGMENT_RE = re.compile(r"-?[0-9]+")
+
+
 def _is_int(segment: str) -> bool:
-    return segment.lstrip("-").isdigit()
+    """True only for segments ``int()`` accepts: ASCII digits with an optional ``-``."""
+    return _INT_SEGMENT_RE.fullmatch(segment) is not None
 
 
 def _iter_refs(value: Any) -> Iterator[Ref]:
@@ -229,42 +234,53 @@ class Plan:
 
     # -- validation ---------------------------------------------------------
 
+    # Both passes are iterative so that very long dependency chains cannot hit
+    # Python's recursion limit, whatever order the steps were declared in.
+
     def _check_cycles(self) -> None:
         white, grey, black = 0, 1, 2
         color = dict.fromkeys(self._steps, white)
-        path: list[str] = []
 
-        def visit(sid: str) -> None:
-            color[sid] = grey
-            path.append(sid)
-            for dep in self._steps[sid].depends_on:
-                if color[dep] == grey:
+        for root in self._steps:
+            if color[root] != white:
+                continue
+            color[root] = grey
+            path = [root]
+            stack = [iter(self._steps[root].depends_on)]
+            while stack:
+                dep = next(stack[-1], None)
+                if dep is None:
+                    stack.pop()
+                    color[path.pop()] = black
+                elif color[dep] == grey:
                     cycle = path[path.index(dep):] + [dep]
                     raise CycleError("dependency cycle: " + " -> ".join(cycle))
-                if color[dep] == white:
-                    visit(dep)
-            path.pop()
-            color[sid] = black
-
-        for sid in self._steps:
-            if color[sid] == white:
-                visit(sid)
+                elif color[dep] == white:
+                    color[dep] = grey
+                    path.append(dep)
+                    stack.append(iter(self._steps[dep].depends_on))
 
     def _compute_levels(self) -> list[list[str]]:
+        # Kahn's algorithm (the graph is known to be acyclic at this point).
         level: dict[str, int] = {}
+        pending = {sid: len(step.depends_on) for sid, step in self._steps.items()}
+        dependents: dict[str, list[str]] = {sid: [] for sid in self._steps}
+        for step in self._steps.values():
+            for dep in step.depends_on:
+                dependents[dep].append(step.id)
+        ready = [sid for sid, count in pending.items() if count == 0]
+        for sid in ready:
+            level[sid] = 0
+        while ready:
+            sid = ready.pop()
+            for child in dependents[sid]:
+                level[child] = max(level.get(child, 0), level[sid] + 1)
+                pending[child] -= 1
+                if pending[child] == 0:
+                    ready.append(child)
 
-        def depth(sid: str) -> int:
-            if sid not in level:
-                deps = self._steps[sid].depends_on
-                level[sid] = 1 + max((depth(d) for d in deps), default=-1)
-            return level[sid]
-
-        layers: list[list[str]] = []
-        for sid in self._steps:
-            idx = depth(sid)
-            while len(layers) <= idx:
-                layers.append([])
-        for sid in self._steps:  # second pass keeps declaration order per layer
+        layers: list[list[str]] = [[] for _ in range(max(level.values(), default=-1) + 1)]
+        for sid in self._steps:  # keeps declaration order within each layer
             layers[level[sid]].append(sid)
         return layers
 
@@ -514,7 +530,7 @@ class ParallelExecutor:
                 done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
                 for task in sorted(done, key=lambda t: order.index(running[t])):
                     sid = running.pop(task)
-                    outcome = task.result()
+                    outcome = self._collect(task, plan[sid], progress[sid])
                     outcomes[sid] = outcome
                     if outcome.status == "succeeded":
                         outputs[sid] = outcome.value
@@ -541,6 +557,22 @@ class ParallelExecutor:
         )
 
     # -- internals ----------------------------------------------------------
+
+    def _collect(self, task: asyncio.Task[StepOutcome], step: Step, prog: _Progress) -> StepOutcome:
+        """The finished step task's outcome; never raises for a step-local problem.
+
+        ``_run_step`` already turns every failure into an outcome, so this only
+        guards against a step task that ended cancelled or crashed anyway: such a
+        step is reported as failed instead of aborting the whole run.
+        """
+        if task.cancelled():
+            return self._failed(step, prog, "CancelledError: step task was cancelled")
+        exc = task.exception()
+        if exc is None:
+            return task.result()
+        if not isinstance(exc, Exception):  # KeyboardInterrupt, SystemExit, ...
+            raise exc
+        return self._failed(step, prog, f"{type(exc).__name__}: {exc}", exc=exc)
 
     async def _cancel_all(
         self,
@@ -580,7 +612,7 @@ class ParallelExecutor:
         self._emit(StepEvent("started", step.id))
         try:
             args = _resolve_refs(step.args, outputs)
-        except ValidationError as exc:
+        except Exception as exc:  # noqa: BLE001 - an unresolvable ref fails only this step
             return self._failed(step, prog, f"{type(exc).__name__}: {exc}", exc=exc)
 
         last_result: ToolResult | None = None
@@ -595,8 +627,14 @@ class ParallelExecutor:
             prog.attempts += 1
             try:
                 result = await self._attempt(step, args, semaphore)
-            except asyncio.CancelledError:
-                raise
+            except asyncio.CancelledError as exc:
+                if _being_cancelled():
+                    raise  # run() (or fail-fast) is cancelling this step: propagate
+                # The tool itself raised CancelledError (e.g. it awaited a child
+                # task that was cancelled): an ordinary failed attempt.
+                last_exc, last_result = exc, None
+                error = f"CancelledError: {exc}" if str(exc) else "CancelledError: tool was cancelled"
+                continue
             except Exception as exc:  # noqa: BLE001 - every failure becomes an outcome
                 last_exc, last_result = exc, None
                 error = f"{type(exc).__name__}: {exc}"
@@ -630,12 +668,16 @@ class ParallelExecutor:
 
     async def _invoke(self, step: Step, args: dict[str, Any]) -> ToolResult:
         timeout = step.timeout if step.timeout is not None else self.default_timeout
+        deadline = asyncio.timeout(timeout)
         try:
-            result = await asyncio.wait_for(self.invoker(step, args), timeout)
-        except ToolTimeoutError:
+            async with deadline:
+                result = await self.invoker(step, args)
+        except TimeoutError as exc:
+            # Only the executor's own deadline is a step timeout; a TimeoutError
+            # raised by the tool/invoker itself is an ordinary failure.
+            if deadline.expired() and not isinstance(exc, ToolTimeoutError):
+                raise ToolTimeoutError(f"step {step.id!r} timed out after {timeout}s") from None
             raise
-        except TimeoutError:
-            raise ToolTimeoutError(f"step {step.id!r} timed out after {timeout}s") from None
         if not isinstance(result, ToolResult):
             raise ExecutionError(
                 f"invoker returned {type(result).__name__} for step {step.id!r}; "
@@ -671,6 +713,12 @@ class ParallelExecutor:
             self.on_event(event)
         except Exception:  # noqa: BLE001 - observers must never break execution
             logger.exception("executor event listener failed for %s", event)
+
+
+def _being_cancelled() -> bool:
+    """True when the current task has a pending cancellation request."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
 
 
 def _skip_reason(step: Step, outcomes: Mapping[str, StepOutcome]) -> str:

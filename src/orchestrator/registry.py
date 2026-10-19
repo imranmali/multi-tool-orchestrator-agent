@@ -30,7 +30,13 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._tools: dict[str, dict[str, ToolSpec]] = {}
+        # Version-level disablement (``disable(name, version)``) and name-level
+        # disablement (``disable(name)``). Name-level disablement is sticky: it
+        # applies to whichever version is the latest *now*, so registering a newer
+        # version or unregistering the latest one cannot silently re-expose the
+        # tool to discovery. Older versions pinned explicitly keep their own state.
         self._disabled: set[tuple[str, str]] = set()
+        self._disabled_names: set[str] = set()
         self._listeners: list[Listener] = []
 
     # -- mutation -----------------------------------------------------------
@@ -54,6 +60,7 @@ class ToolRegistry:
             removed = [versions.pop(v) for v in targets]
             if not versions:
                 del self._tools[name]
+                self._disabled_names.discard(name)
             for spec in removed:
                 self._disabled.discard(spec.key)
         for spec in removed:
@@ -61,15 +68,23 @@ class ToolRegistry:
         return removed
 
     def disable(self, name: str, version: str | None = None) -> None:
+        """Disable one version, or the tool name (its latest version, now and later)."""
         self._set_enabled(name, version, enabled=False)
 
     def enable(self, name: str, version: str | None = None) -> None:
+        """Enable one version, or the whole tool (clears name-level disablement)."""
         self._set_enabled(name, version, enabled=True)
 
     def _set_enabled(self, name: str, version: str | None, *, enabled: bool) -> None:
         with self._lock:
             spec = self.get(name, version)
-            if enabled:
+            if version is None:
+                if enabled:
+                    self._disabled_names.discard(name)
+                    self._disabled.discard(spec.key)
+                else:
+                    self._disabled_names.add(name)
+            elif enabled:
                 self._disabled.discard(spec.key)
             else:
                 self._disabled.add(spec.key)
@@ -91,7 +106,12 @@ class ToolRegistry:
 
     def is_enabled(self, name: str, version: str | None = None) -> bool:
         with self._lock:
-            return self.get(name, version).key not in self._disabled
+            return self._enabled(self.get(name, version))
+
+    def _enabled(self, spec: ToolSpec) -> bool:
+        if spec.key in self._disabled:
+            return False
+        return spec.name not in self._disabled_names or spec.key != self.get(spec.name).key
 
     def list(self, *, include_disabled: bool = True) -> list[ToolSpec]:
         """Latest version of every tool name, sorted by name."""
@@ -99,7 +119,7 @@ class ToolRegistry:
             latest = [self.get(name) for name in sorted(self._tools)]
             if include_disabled:
                 return latest
-            return [s for s in latest if s.key not in self._disabled]
+            return [s for s in latest if self._enabled(s)]
 
     def versions(self, name: str) -> list[str]:
         with self._lock:

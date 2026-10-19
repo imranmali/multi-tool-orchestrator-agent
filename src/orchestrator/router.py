@@ -124,8 +124,8 @@ def _balanced(entries: list[_Entry]) -> list[tuple[float, ...]]:
     keys = []
     for _, cap, st in entries:
         prio_n = (cap.priority - p_min) / (p_max - p_min) if p_max > p_min else 1.0
-        cheap_n = 1.0 - cap.cost / cost_max if cost_max > 0 else 1.0
-        fast_n = 1.0 - cap.latency / lat_max if lat_max > 0 else 1.0
+        cheap_n = _inverse_norm(cap.cost, cost_max)
+        fast_n = _inverse_norm(cap.latency, lat_max)
         score = (
             w["priority"] * prio_n
             + w["cost"] * cheap_n
@@ -134,6 +134,16 @@ def _balanced(entries: list[_Entry]) -> list[tuple[float, ...]]:
         )
         keys.append((score,))
     return keys
+
+
+def _inverse_norm(value: float, maximum: float) -> float:
+    """``1 - value / maximum`` in [0, 1]; never NaN, even for infinite hints."""
+    if maximum <= 0:
+        return 1.0
+    if math.isinf(maximum):
+        # inf/inf is NaN: an infinite hint is the worst possible, finite ones the best.
+        return 0.0 if math.isinf(value) else 1.0
+    return 1.0 - value / maximum
 
 
 _BUILTIN: dict[str, _Ranker] = {
@@ -233,13 +243,22 @@ class CapabilityRouter:
                 h.latency_samples += 1
 
     def record_failure(self, name: str) -> None:
-        """Report a failed invocation; may open (or reopen) the tool's circuit."""
+        """Report a failed invocation; may open (or reopen) the tool's circuit.
+
+        The cooldown (re)starts when the threshold is reached from the closed
+        state or when a half-open tool fails. A failure reported while the
+        circuit is already open (e.g. a straggling in-flight call) is counted
+        but does not push the cooldown back.
+        """
         with self._lock:
             now = self._clock()
             h = self._health.setdefault(name, _Health())
             h.failures += 1
             h.consecutive_failures += 1
-            if h.opened_at is not None or h.consecutive_failures >= self._threshold:
+            if h.opened_at is None:
+                if h.consecutive_failures >= self._threshold:
+                    h.opened_at = now
+            elif now - h.opened_at >= self._cooldown:  # half-open: reopen
                 h.opened_at = now
 
     def stats(self, name: str) -> ToolStats:
