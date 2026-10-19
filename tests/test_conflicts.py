@@ -241,7 +241,9 @@ def test_merge_conflict_raises_by_default(resolver):
 
 def test_merge_conflict_lists_every_path(resolver):
     with pytest.raises(ConflictError) as info:
-        resolver.resolve([ok("a", {"x": 1, "y": {"z": 1}}), ok("b", {"x": 2, "y": {"z": 2}})], "merge")
+        resolver.resolve(
+            [ok("a", {"x": 1, "y": {"z": 1}}), ok("b", {"x": 2, "y": {"z": 2}})], "merge"
+        )
     assert "x" in str(info.value) and "y.z" in str(info.value)
 
 
@@ -717,9 +719,9 @@ def test_module_imports_only_core_and_stdlib():
     tree = ast.parse(pathlib.Path(mod.__file__).read_text())
     local = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.level:
-            local.add(node.module)
-        elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("orchestrator"):
+        if isinstance(node, ast.ImportFrom) and (
+            node.level or (node.module or "").startswith("orchestrator")
+        ):
             local.add(node.module)
     assert local <= {"core", "orchestrator.core"}
 
@@ -833,7 +835,82 @@ def test_majority_name_tie_uses_smallest_name_in_group(resolver):
 
 def test_majority_priority_tie_break_still_precedes_name(resolver):
     res = resolver.resolve(
-        [ok("a", "X", priority=0), ok("z", "Y", priority=9), ok("b", "X", priority=0), ok("c", "Y")],
+        [
+            ok("a", "X", priority=0),
+            ok("z", "Y", priority=9),
+            ok("b", "X", priority=0),
+            ok("c", "Y"),
+        ],
         "majority",
     )
     assert res.value == "Y"
+
+
+# -- clarify-edge-cases: numeric overflow and type-aware majority -------------
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+def test_numeric_each_non_finite_value_is_conflict(resolver, bad):
+    with pytest.raises(ConflictError, match="non-finite"):
+        resolver.resolve([ok("a", 1), ok("b", bad)], "numeric")
+
+
+@pytest.mark.parametrize("agg", ["mean", "median"])
+@pytest.mark.parametrize("values", [[1e308, 1e308], [10**400, 1]])
+def test_numeric_aggregate_overflow_is_conflict(resolver, agg, values):
+    results = [ok(f"t{i}", v) for i, v in enumerate(values)]
+    with pytest.raises(ConflictError, match="overflowed"):
+        resolver.resolve(results, "numeric", agg=agg)
+
+
+def test_numeric_median_never_returns_inf(resolver):
+    # (a + b) / 2 overflows silently for floats; it must not leak out as inf.
+    with pytest.raises(ConflictError, match="median"):
+        resolver.resolve([ok("a", 1.7e308), ok("b", 1.7e308)], "numeric", agg="median")
+
+
+@pytest.mark.parametrize("agg", ["mean", "median", "min", "max"])
+@pytest.mark.parametrize("values", [[-1.7e308, 1.7e308], [10**400, 1.5]])
+def test_numeric_spread_overflow_is_conflict(resolver, agg, values):
+    results = [ok(f"t{i}", v) for i, v in enumerate(values)]
+    with pytest.raises(ConflictError, match="overflowed"):
+        resolver.resolve(results, "numeric", agg=agg)
+
+
+@pytest.mark.parametrize("agg", ["min", "max"])
+def test_numeric_huge_finite_floats_without_overflow(resolver, agg):
+    res = resolver.resolve([ok("a", 1e308), ok("b", 1e308)], "numeric", agg=agg)
+    assert res.value == 1e308
+    assert res.confidence == 1.0
+    assert res.details["spread"] == 0
+
+
+def test_majority_float_does_not_group_with_true(resolver):
+    res = resolver.resolve([ok("a", 1.0), ok("b", True), ok("c", 1.0)], "majority")
+    assert res.winners == ("a", "c")
+    assert res.dissenters == ("b",)
+
+
+@pytest.mark.parametrize("first,second", [(1, "1"), ([1], (1,)), (b"a", "a"), (0, False)])
+def test_majority_type_aware_values_form_separate_groups(resolver, first, second):
+    res = resolver.resolve([ok("a", first), ok("b", second)], "majority")
+    assert res.details["groups"] == [["a"], ["b"]]
+    assert res.winners == ("a",)
+
+
+def test_majority_dictionary_keys_compared_type_aware(resolver):
+    res = resolver.resolve(
+        [ok("a", {1: "x"}), ok("b", {1.0: "x"}), ok("c", {"1": "x"}), ok("d", {True: "x"})],
+        "majority",
+    )
+    assert res.details["groups"] == [["a", "b"], ["c"], ["d"]]
+    assert res.value == {1: "x"}
+    assert res.winners == ("a", "b")
+
+
+def test_majority_nan_groups_with_nan(resolver):
+    first, second = float("nan"), float("nan")
+    assert first is not second  # exercise equality, not the identity shortcut
+    res = resolver.resolve([ok("a", first), ok("b", second), ok("c", 0.0)], "majority")
+    assert res.winners == ("a", "b")
+    assert res.dissenters == ("c",)

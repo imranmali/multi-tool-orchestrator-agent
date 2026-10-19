@@ -13,20 +13,22 @@ This module depends only on :mod:`orchestrator.core` and the standard library.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import math
 import statistics
 from collections import deque
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any
 
 from .core import ConflictError, ToolResult, ValidationError
 
 __all__ = [
-    "Resolution",
+    "LOCK_MODES",
     "ConflictResolver",
+    "Resolution",
     "ResourceLockManager",
     "detect_write_conflicts",
-    "LOCK_MODES",
 ]
 
 StrategyFn = Callable[..., Any]
@@ -67,7 +69,7 @@ def _same(a: Any, b: Any) -> bool:
         if isinstance(a, kind) or isinstance(b, kind):
             if not (isinstance(a, kind) and isinstance(b, kind)) or len(a) != len(b):
                 return False
-            return all(_same(x, y) for x, y in zip(a, b))
+            return all(_same(x, y) for x, y in zip(a, b, strict=True))
     if isinstance(a, bool) or isinstance(b, bool):
         return isinstance(a, bool) and isinstance(b, bool) and a == b
     if isinstance(a, _SCALARS) or isinstance(b, _SCALARS):
@@ -76,7 +78,7 @@ def _same(a: Any, b: Any) -> bool:
         return True
     try:
         return bool(a == b)
-    except Exception:  # noqa: BLE001 - exotic __eq__ / ambiguous truth value
+    except Exception:
         return False
 
 
@@ -246,13 +248,12 @@ class ConflictResolver:
         self, results: Sequence[ToolResult], quorum: float | None = None, **options: Any
     ) -> Resolution:
         self._check_options("majority", options, ("quorum",))
-        if quorum is not None:
-            if (
-                isinstance(quorum, bool)
-                or not isinstance(quorum, (int, float))
-                or not 0 < quorum <= 1
-            ):
-                raise ValidationError(f"quorum must be in (0, 1], got {quorum!r}")
+        if quorum is not None and (
+            isinstance(quorum, bool)
+            or not isinstance(quorum, (int, float))
+            or not 0 < quorum <= 1
+        ):
+            raise ValidationError(f"quorum must be in (0, 1], got {quorum!r}")
 
         groups: list[tuple[Any, list[ToolResult]]] = []
         for result in results:
@@ -298,7 +299,8 @@ class ConflictResolver:
         if not all(isinstance(v, Mapping) for v in values):
             first = values[0]
             if all(_same(first, v) for v in values[1:]):
-                return self._wrap("merge", first, results, {"conflicts": [], "on_conflict": on_conflict})
+                meta = {"conflicts": [], "on_conflict": on_conflict}
+                return self._wrap("merge", first, results, meta)
             raise ConflictError(
                 "merge requires dictionary values unless all values are equal; got "
                 + ", ".join(f"{r.tool}: {type(r.value).__name__}" for r in results)
@@ -316,7 +318,7 @@ class ConflictResolver:
                         if k not in keys:
                             keys.append(k)
                 return {
-                    k: merge_at(path + (k,), [(r, v[k]) for r, v in contribs if k in v])
+                    k: merge_at((*path, k), [(r, v[k]) for r, v in contribs if k in v])
                     for k in keys
                 }
             if all(isinstance(v, list) for v in vals):
@@ -369,7 +371,9 @@ class ConflictResolver:
             },
         )
 
-    def _numeric(self, results: Sequence[ToolResult], agg: str = "mean", **options: Any) -> Resolution:
+    def _numeric(
+        self, results: Sequence[ToolResult], agg: str = "mean", **options: Any
+    ) -> Resolution:
         self._check_options("numeric", options, ("agg",))
         aggregators: dict[str, Callable[[list[float]], float]] = {
             "mean": _mean,
@@ -398,7 +402,14 @@ class ConflictResolver:
             value = aggregators[agg](nums)
         except OverflowError as exc:
             raise ConflictError(f"numeric {agg} of {nums!r} overflowed: {exc}") from None
-        if isinstance(value, float) and value.is_integer() and all(isinstance(n, int) for n in nums):
+        if isinstance(value, float) and not math.isfinite(value):
+            # Float arithmetic overflows silently, e.g. median's (a + b) / 2.
+            raise ConflictError(f"numeric {agg} of {nums!r} overflowed to {value}")
+        if (
+            isinstance(value, float)
+            and value.is_integer()
+            and all(isinstance(n, int) for n in nums)
+        ):
             value = int(value)
         low, high = min(nums), max(nums)
         try:
@@ -406,6 +417,8 @@ class ConflictResolver:
             ratio = spread / max(abs(low), abs(high)) if spread else 0.0
         except OverflowError as exc:  # e.g. a huge int mixed with a float
             raise ConflictError(f"numeric spread of {nums!r} overflowed: {exc}") from None
+        if isinstance(spread, float) and not math.isfinite(spread):
+            raise ConflictError(f"numeric spread of {nums!r} overflowed to {spread}")
         if spread == 0:
             confidence = 1.0
         else:
@@ -528,15 +541,16 @@ class ResourceLockManager:
         resources: Mapping[str, str],
         *,
         timeout: float | None = None,
-    ) -> "_Hold":
+    ) -> _Hold:
         """Async context manager holding ``resources`` (name -> 'read'|'write') for ``owner``."""
         if not isinstance(owner, str) or not owner:
             raise ValidationError(f"owner must be a non-empty string, got {owner!r}")
         for resource, mode in resources.items():
             _validate_mode(resource, mode)
-        if timeout is not None:
-            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
-                raise ValidationError(f"timeout must be a non-negative number, got {timeout!r}")
+        if timeout is not None and (
+            isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0
+        ):
+            raise ValidationError(f"timeout must be a non-negative number, got {timeout!r}")
         plan = tuple(sorted(resources.items()))
         return _Hold(self, owner, plan, timeout)
 
@@ -598,14 +612,14 @@ class ResourceLockManager:
                 state.holders.pop(owner, None)
             else:
                 waiter.future.cancel()
-                try:
+                with contextlib.suppress(ValueError):
                     state.queue.remove(waiter)
-                except ValueError:
-                    pass
             self._grant(resource)
             raise
 
-    async def _acquire_all(self, owner: str, plan: tuple[tuple[str, str], ...], acquired: list[str]) -> None:
+    async def _acquire_all(
+        self, owner: str, plan: tuple[tuple[str, str], ...], acquired: list[str]
+    ) -> None:
         for resource, mode in plan:
             await self._acquire_one(owner, resource, mode)
             acquired.append(resource)
@@ -632,7 +646,7 @@ class _Hold:
     def resources(self) -> dict[str, str]:
         return dict(self._plan)
 
-    async def __aenter__(self) -> "_Hold":
+    async def __aenter__(self) -> _Hold:
         if self._entered:
             raise ConflictError("a hold can only be entered once")
         self._entered = True

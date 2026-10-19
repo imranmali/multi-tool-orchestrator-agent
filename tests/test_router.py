@@ -1,8 +1,9 @@
+import math
 import threading
 
 import pytest
-
 from conftest import make_tool
+
 from orchestrator import Capability, NoRouteError, ToolRegistry, ValidationError
 from orchestrator.router import (
     CLOSED,
@@ -186,7 +187,7 @@ def test_fastest_strategy(registry, router):
 
 def test_default_strategy_is_balanced(registry):
     assert CapabilityRouter(registry).strategy == "balanced"
-    assert STRATEGIES == {"priority", "cheapest", "fastest", "balanced"}
+    assert {"priority", "cheapest", "fastest", "balanced"} == STRATEGIES
 
 
 def test_balanced_dominating_tool_wins(registry, router):
@@ -266,7 +267,7 @@ def test_non_callable_strategy_rejected(registry):
         CapabilityRouter(registry, strategy=42)
 
 
-@pytest.mark.parametrize("strategy", sorted(STRATEGIES) + ["custom"])
+@pytest.mark.parametrize("strategy", [*sorted(STRATEGIES), "custom"])
 def test_ties_broken_by_name(registry, router, strategy):
     for n in ("zeta", "alpha", "mid"):
         add(registry, n, cap(cost=2, latency=3, priority=1))
@@ -536,3 +537,50 @@ def test_infinite_latency_ranks_slowest(registry, router):
 def test_nan_cost_rejected_at_declaration():
     with pytest.raises(ValidationError):
         cap(cost=float("nan"))
+
+
+# -- clarify-edge-cases: infinite hints -------------------------------------------
+
+INF = float("inf")
+
+
+def test_priority_strategy_ranks_infinite_hints_last_within_a_priority(registry, router):
+    add(registry, "a", cap(cost=INF, latency=1.0, priority=9))
+    add(registry, "d", cap(cost=INF, latency=INF, priority=9))
+    add(registry, "c", cap(cost=5.0, latency=2.0, priority=0))
+    assert names(router.candidates("search", strategy="priority")) == ["a", "d", "c"]
+
+
+def test_cheapest_ranks_infinite_cost_after_every_finite_cost(registry, router):
+    add(registry, "a", cap(cost=INF, priority=9))
+    add(registry, "b", cap(cost=1e300))
+    add(registry, "c", cap(cost=5.0))
+    assert names(router.candidates("search", strategy="cheapest")) == ["c", "b", "a"]
+
+
+@pytest.mark.parametrize("strategy", sorted(STRATEGIES))
+def test_infinite_hints_never_yield_nan_scores(registry, router, strategy):
+    add(registry, "a", cap(cost=INF, latency=1.0, priority=9))
+    add(registry, "b", cap(cost=1e300, latency=INF))
+    add(registry, "c", cap(cost=5.0, latency=2.0))
+    add(registry, "d", cap(cost=INF, latency=INF, priority=9))
+    scores = [e.score for e in router.explain("search", strategy=strategy)]
+    assert len(scores) == 4
+    assert not any(math.isnan(s) for s in scores)
+
+
+def test_balanced_score_finite_with_infinite_hints(registry, router):
+    add(registry, "a", cap(cost=INF, latency=INF, priority=9))
+    add(registry, "b", cap(cost=1e300, latency=INF))
+    add(registry, "c", cap(cost=5.0, latency=2.0))
+    explained = router.explain("search")
+    assert all(math.isfinite(e.score) for e in explained)
+
+
+def test_balanced_all_hints_infinite_ties_by_name(registry, router):
+    add(registry, "b", cap(cost=INF, latency=INF))
+    add(registry, "a", cap(cost=INF, latency=INF))
+    explained = router.explain("search")
+    assert [e.tool for e in explained] == ["a", "b"]
+    assert explained[0].score == explained[1].score
+    assert math.isfinite(explained[0].score)
