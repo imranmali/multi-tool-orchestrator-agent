@@ -6,8 +6,9 @@ least one such block, and every relative link must point at a file or folder
 that exists. A link to ``openspec/specs/<capability>/spec.md`` is also accepted
 while an active OpenSpec change still provides that capability's delta spec, so
 the link is valid both before and after the change is archived. The
-requirement counts in the specification index must match the specs, and the
-demo's sample output must be an in-order excerpt of the real demo output.
+requirement counts in the specification index must match the specs, the
+demo's sample output must be an in-order excerpt of the real demo output, and
+the prose must not quote test counts (they go stale with every new test).
 """
 
 from __future__ import annotations
@@ -92,7 +93,7 @@ def test_python_block_runs(block: Block) -> None:
     # Pad so tracebacks report the real README line numbers.
     source = "\n" * block.line + block.code
     try:
-        exec(compile(source, str(README), "exec"), namespace)  # noqa: S102 - the point of the test
+        exec(compile(source, str(README), "exec"), namespace)  # executing the block is the point
     except Exception as exc:  # report which block failed
         raise AssertionError(
             f"README.md python block starting on line {block.line} "
@@ -173,7 +174,8 @@ def _spec_file(capability: str) -> Path | None:
     main = ROOT / "openspec" / "specs" / capability / "spec.md"
     if main.exists():
         return main
-    return next(iter(sorted((ROOT / "openspec" / "changes").glob(f"*/specs/{capability}/spec.md"))), None)
+    deltas = sorted((ROOT / "openspec" / "changes").glob(f"*/specs/{capability}/spec.md"))
+    return next(iter(deltas), None)
 
 
 def test_spec_index_requirement_counts() -> None:
@@ -204,4 +206,19 @@ def test_demo_sample_output_matches_real_output() -> None:
         try:
             position = actual.index(line, position) + 1
         except ValueError:
-            raise AssertionError(f"sample demo line not found (in order) in real output: {line!r}") from None
+            raise AssertionError(
+                f"sample demo line not found (in order) in real output: {line!r}"
+            ) from None
+
+
+_TEST_COUNT_RE = re.compile(r"\b\d+\s+(?:passed|failed|tests?)\b", re.IGNORECASE)
+
+
+def test_no_hard_coded_test_counts() -> None:
+    stale = [line.strip() for line in PROSE if _TEST_COUNT_RE.search(line)]
+    stale += [
+        line.strip()
+        for line in PROSE
+        if line.startswith("|") and "tests" in [cell.strip().lower() for cell in line.split("|")]
+    ]
+    assert not stale, f"README.md quotes test counts, which go stale: {stale}"
