@@ -31,8 +31,8 @@ import re
 import threading
 import time
 from collections import deque
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Mapping
 
 from .core import PermissionDeniedError, ToolSpec, ValidationError
 
@@ -384,7 +384,9 @@ class PermissionPolicy:
         decision = self.decide(principal, tool)
         self._record(principal, tool, decision)
         if not decision.allowed:
-            message = f"principal {principal.id!r} may not use tool {tool.name!r}: {decision.reason}"
+            message = (
+                f"principal {principal.id!r} may not use tool {tool.name!r}: {decision.reason}"
+            )
             raise AccessDeniedError(
                 message,
                 principal_id=principal.id,
@@ -471,7 +473,9 @@ def _effective(principal: Principal, roles: Mapping[str, frozenset[str]]) -> fro
     return frozenset(scopes)
 
 
-def _rule_hit(principal: Principal, tool_name: str, rules: frozenset[tuple[str, str]]) -> str | None:
+def _rule_hit(
+    principal: Principal, tool_name: str, rules: frozenset[tuple[str, str]]
+) -> str | None:
     if (principal.id, tool_name) in rules:
         return principal.id
     for role in sorted(principal.roles):
@@ -506,10 +510,12 @@ def _decide(
     effective = _effective(principal, roles)
     missing = frozenset(r for r in required if not any(_covers(g, r) for g in effective))
     if not missing:
-        return Decision(True, frozenset(), "all required scopes granted" if required else "tool requires no scopes")
+        reason = "all required scopes granted" if required else "tool requires no scopes"
+        return Decision(True, frozenset(), reason)
 
     subject = _rule_hit(principal, name, allow)
-    if subject is not None:
-        if principal.parent is None or _decide(principal.parent, tool, roles, deny, allow).allowed:
-            return Decision(True, frozenset(), f"tool {name!r} is explicitly allowed for {subject!r}")
+    if subject is not None and (
+        principal.parent is None or _decide(principal.parent, tool, roles, deny, allow).allowed
+    ):
+        return Decision(True, frozenset(), f"tool {name!r} is explicitly allowed for {subject!r}")
     return Decision(False, missing, f"missing scopes: {_fmt(missing)}")

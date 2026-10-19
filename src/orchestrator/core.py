@@ -5,8 +5,9 @@ from __future__ import annotations
 import inspect
 import math
 import re
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any
 
 Handler = Callable[..., Awaitable[Any]]
 

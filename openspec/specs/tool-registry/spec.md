@@ -6,7 +6,7 @@ Provides the authoritative, runtime-mutable catalog of tools the orchestrator ca
 ## Requirements
 
 ### Requirement: Tool descriptor validation
-A tool descriptor SHALL declare a non-empty name matching `[a-z0-9][a-z0-9_.-]*`, a semantic version `MAJOR.MINOR.PATCH`, at least one capability, and an async handler. Invalid descriptors MUST be rejected with a validation error at construction time.
+A tool descriptor SHALL declare a non-empty name matching `[a-z0-9][a-z0-9_.-]*`, a semantic version `MAJOR.MINOR.PATCH`, at least one capability, and an async handler. Invalid descriptors MUST be rejected with a validation error at construction time. Names, capability names and versions MUST match their whole pattern, so a trailing newline or non-ASCII digit is rejected.
 
 #### Scenario: Valid descriptor
 - **WHEN** a tool is defined with name `web.search`, version `1.2.0`, capability `search` and an async handler
@@ -20,8 +20,20 @@ A tool descriptor SHALL declare a non-empty name matching `[a-z0-9][a-z0-9_.-]*`
 - **WHEN** a tool is defined with version `1.2`
 - **THEN** a validation error is raised
 
+#### Scenario: Trailing newline in name rejected
+- **WHEN** a tool is defined with name `"calc\n"`
+- **THEN** a validation error is raised
+
+#### Scenario: Trailing newline in version rejected
+- **WHEN** a tool is defined with version `"1.0.0\n"`
+- **THEN** a validation error is raised
+
+#### Scenario: Trailing newline in capability name rejected
+- **WHEN** a capability is declared with name `"search\n"`
+- **THEN** a validation error is raised
+
 ### Requirement: Capability declarations carry routing hints
-Each declared capability SHALL carry a name plus non-negative cost and latency hints and an integer priority, with defaults of cost 1.0, latency 1.0 and priority 0 when omitted.
+Each declared capability SHALL carry a name plus non-negative cost and latency hints and an integer priority, with defaults of cost 1.0, latency 1.0 and priority 0 when omitted. A cost or latency that is negative, NaN, boolean or not a number MUST be rejected with a validation error, while positive infinity MUST be accepted. A priority that is a boolean or not an integer MUST be rejected with a validation error.
 
 #### Scenario: Default hints
 - **WHEN** a capability is declared only by name `summarize`
@@ -29,6 +41,18 @@ Each declared capability SHALL carry a name plus non-negative cost and latency h
 
 #### Scenario: Negative cost rejected
 - **WHEN** a capability is declared with cost -1
+- **THEN** a validation error is raised
+
+#### Scenario: NaN hint rejected
+- **WHEN** a capability is declared with cost NaN or latency NaN
+- **THEN** a validation error is raised
+
+#### Scenario: Infinite hint accepted
+- **WHEN** a capability is declared with an infinite cost or an infinite latency
+- **THEN** the capability is created with that infinite hint
+
+#### Scenario: Boolean priority rejected
+- **WHEN** a capability is declared with priority `True` or priority `1.0`
 - **THEN** a validation error is raised
 
 ### Requirement: Dynamic registration
@@ -73,7 +97,7 @@ The registry SHALL return every enabled tool (latest version per name) that decl
 - **THEN** an empty result is returned
 
 ### Requirement: Enable and disable tools
-The registry SHALL allow a tool to be disabled without unregistering it. Disabled tools MUST be excluded from capability discovery but remain retrievable by explicit lookup, and can be re-enabled.
+The registry SHALL allow a tool to be disabled without unregistering it, either one version at a time or as a whole tool name. A version MUST count as enabled only when neither that version nor its tool name is disabled. Disabled tools MUST be excluded from capability discovery but remain retrievable by explicit lookup, and can be re-enabled.
 
 #### Scenario: Disabled tool hidden from discovery
 - **WHEN** tool `a` declaring `search` is disabled
@@ -83,8 +107,16 @@ The registry SHALL allow a tool to be disabled without unregistering it. Disable
 - **WHEN** a disabled tool `a` is enabled again
 - **THEN** querying capability `search` returns `a`
 
+#### Scenario: Version-level disable
+- **WHEN** `calc` versions `1.0.0` and `2.0.0` are registered and only version `1.0.0` is disabled
+- **THEN** version `1.0.0` reports disabled, version `2.0.0` reports enabled and is still discovered
+
+#### Scenario: Enabling a version does not override a name-level disable
+- **WHEN** `calc` versions `1.0.0` and `2.0.0` are registered, `calc` is disabled without a version, and then version `1.0.0` is enabled
+- **THEN** both versions still report disabled until `calc` is enabled without a version
+
 ### Requirement: Registry change notifications
-The registry SHALL notify subscribed listeners of register, unregister, enable and disable events with the event kind and tool identity. A failing listener MUST NOT prevent the registry operation or other listeners.
+The registry SHALL notify subscribed listeners of register, unregister, enable and disable events with the event kind and tool identity. Each enable or disable call MUST emit exactly one event, naming the given version, or the latest version when the call names only the tool. A failing listener MUST NOT prevent the registry operation or other listeners.
 
 #### Scenario: Listener receives registration
 - **WHEN** a listener is subscribed and tool `a` is registered
@@ -93,3 +125,26 @@ The registry SHALL notify subscribed listeners of register, unregister, enable a
 #### Scenario: Failing listener isolated
 - **WHEN** one listener raises an exception during a registration
 - **THEN** the tool is still registered and the other listeners are still notified
+
+#### Scenario: Whole-tool disable emits one event
+- **WHEN** `calc` versions `1.0.0` and `2.0.0` are registered and `calc` is disabled without a version
+- **THEN** the listener receives exactly one `disabled` event, naming `calc` and version `2.0.0`
+
+### Requirement: Name-level disablement covers every version
+Disabling a tool name without a version SHALL disable every version registered under that name, including versions registered while the name stays disabled. Enabling the name without a version SHALL clear the name-level disablement and every per-version disablement of that name. Unregistering every version of a name MUST forget both kinds of disablement for that name.
+
+#### Scenario: Pinned older version disabled
+- **WHEN** `calc` versions `1.0.0` and `2.0.0` are registered and `calc` is disabled without a version
+- **THEN** looking up whether version `1.0.0` is enabled reports disabled, and a lookup of version `1.0.0` still returns it
+
+#### Scenario: Later version stays disabled
+- **WHEN** `calc` is disabled without a version and version `3.0.0` is registered afterwards
+- **THEN** version `3.0.0` reports disabled and capability discovery does not return `calc`
+
+#### Scenario: Enabling the name clears every flag
+- **WHEN** version `1.0.0` of `calc` is disabled, then `calc` is disabled and enabled again without a version
+- **THEN** every version of `calc`, including `1.0.0`, reports enabled
+
+#### Scenario: Full unregister forgets the disablement
+- **WHEN** `calc` is disabled without a version, every version is unregistered and `calc` is registered again
+- **THEN** the newly registered `calc` reports enabled

@@ -105,3 +105,24 @@ def test_capability_infinite_hint_is_non_negative():
 def test_capability_priority_rejects_bool():
     with pytest.raises(ValidationError):
         Capability("search", priority=True)
+
+
+# -- clarify-edge-cases -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("field", ["cost", "latency"])
+def test_capability_accepts_infinite_hint(field):
+    capability = Capability("search", **{field: float("inf")})
+    assert getattr(capability, field) == float("inf")
+
+
+@pytest.mark.parametrize("priority", [True, False, 1.0, "1", None])
+def test_capability_priority_must_be_a_non_bool_int(priority):
+    with pytest.raises(ValidationError):
+        Capability("search", priority=priority)
+
+
+@pytest.mark.parametrize("bad", ["search\n", "search\n\n"])
+def test_capability_name_with_trailing_newline_rejected_in_descriptor(bad):
+    with pytest.raises(ValidationError):
+        ToolSpec("calc", "1.0.0", (bad,), _h)

@@ -12,8 +12,9 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Callable, Iterable, Protocol, Union
+from typing import Protocol
 
 from .core import Capability, NoRouteError, ToolSpec, ValidationError
 from .registry import ToolRegistry
@@ -53,7 +54,7 @@ class RoutingStrategy(Protocol):
     def __call__(self, spec: ToolSpec, capability: Capability, stats: ToolStats) -> float: ...
 
 
-StrategyLike = Union[str, RoutingStrategy]
+StrategyLike = str | RoutingStrategy
 Eligible = Callable[[ToolSpec], bool]
 
 

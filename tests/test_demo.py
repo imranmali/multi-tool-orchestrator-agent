@@ -228,7 +228,8 @@ async def test_run_demo_is_deterministic():
     first = await run_demo()
     second = await run_demo()
     assert first == second
-    assert first.startswith(f"Multi-tool orchestrator demo (orchestrator {orchestrator.__version__})")
+    header = f"Multi-tool orchestrator demo (orchestrator {orchestrator.__version__})"
+    assert first.startswith(header)
 
 
 def _assert_key_lines(out: str) -> None:

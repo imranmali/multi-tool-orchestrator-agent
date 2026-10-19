@@ -1,5 +1,8 @@
 # Multi-Tool Orchestrator Agent
 
+[![CI](https://github.com/imranmali/multi-tool-orchestrator-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/imranmali/multi-tool-orchestrator-agent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 `orchestrator` is a small, dependency-free Python 3.11+ library for running many
 async tools behind one agent. You register tools with the capabilities they
 offer and the scopes they need. You then describe the work as a plan of steps,
@@ -52,6 +55,7 @@ in this README runs as part of the test suite.
 - [Project layout](#project-layout)
 - [Spec-driven development with OpenSpec](#spec-driven-development-with-openspec)
 - [Testing](#testing)
+  - [Continuous integration](#continuous-integration)
 - [Design decisions and limitations](#design-decisions-and-limitations)
 - [Contributing](#contributing)
 - [License](#license)
@@ -117,12 +121,13 @@ run(plan, principal, fanout=..., preflight=...)
   +- ParallelExecutor(invoker, lock_manager=<run-scoped>, on_event=<run stream>)
   |    for each ready step, per attempt:  lock resources -> concurrency slot -> step timeout
   |      invoker(step, args)
-  |        named tool: lookup (version pin) -> enabled? -> validate input -> routed
-  |                    -> audited policy.check -> handler under tool_timeout -> health
-  |        capability: candidates(eligible=policy.predicate) -> validate -> routed
+  |        named tool: lookup (version pin) -> available? -> validate input -> claims held?
+  |                    -> routed -> available? -> audited policy.check
+  |                    -> handler under tool_timeout -> health
+  |        capability: candidates(eligible=policy.predicate) -> validate -> routed -> available?
   |                    -> audited check -> invoke -> on failure: fallback(next) ... max_fallbacks
-  |        fan-out:    top-n candidates -> audited checks -> invoke all concurrently
-  |                    -> resolver.resolve(strategy) -> resolved
+  |        fan-out:    top-n candidates -> routed -> available? -> audited checks
+  |                    -> invoke all concurrently -> resolver.resolve(strategy) -> resolved
   +- RunReport(run_id, execution, served_by, attempts, resolutions, audit,
                issues, contentions, events)
 ```
@@ -146,9 +151,14 @@ by principal `ana`:
    open circuit, and the candidates are ranked by the router's strategy. The
    best candidate whose input schema accepts the args is chosen, and a `routed`
    event is emitted.
-4. **Permission check.** `policy.check(ana, tool)` writes an audit record, which
-   is also copied into `report.audit`. A denial raises `AccessDeniedError` and
-   emits a `denied` event.
+4. **Availability and permission check.** The invoker re-checks that the exact
+   descriptor it chose is still registered and enabled (the `available?` box
+   above). A tool that was disabled, unregistered or replaced in the meantime
+   is never invoked: it is recorded with the attempt outcome `unavailable`, and
+   the invoker moves on to the next candidate without spending the fallback
+   budget. Then `policy.check(ana, tool)` writes an audit record, which is also
+   copied into `report.audit`. A denial raises `AccessDeniedError` and emits a
+   `denied` event.
 5. **Invocation.** The handler is awaited under `tool_timeout`. Success and
    failure are reported to the router (`record_success` with the call's latency,
    or `record_failure`), so the health of each tool builds up across runs.
@@ -172,13 +182,16 @@ by principal `ana`:
 ## Installation
 
 Requirements: Python 3.11 or newer. There are **no runtime dependencies**; the
-library uses only the standard library. Development needs `pytest` and
-`pytest-asyncio`.
+library uses only the standard library. The `dev` extra installs the
+development tools: `pytest`, `pytest-asyncio` and `ruff`. Building the package
+needs `setuptools>=77`, the first release that understands the PEP 639 license
+expression (`license = "MIT"`) used in `pyproject.toml`; pip fetches it
+automatically.
 
 ```bash
-git clone <this repository> multi-tool-orchestrator-agent
+git clone https://github.com/imranmali/multi-tool-orchestrator-agent.git
 cd multi-tool-orchestrator-agent
-pip install -e '.[dev]'
+pip install -e '.[dev]'       # the library plus pytest, pytest-asyncio and ruff
 python3 -m pytest -q          # run the test suite
 python3 -m orchestrator       # run the demo
 ```
@@ -315,10 +328,10 @@ assert asyncio.run(spec.handler(query="q")) == ["v2: q"]
 assert [s.name for s in registry.find_by_capability("search")] == ["web.search"]
 assert registry.capabilities() == {"search", "lookup"}
 
-registry.disable("web.search")
+registry.disable("web.search")                          # the whole name: every version
 assert not registry.is_enabled("web.search")
 assert registry.find_by_capability("search") == []      # 1.0.0 does not stand in for it
-assert registry.is_enabled("web.search", "1.0.0")
+assert not registry.is_enabled("web.search", "1.0.0")  # every version is disabled
 assert registry.get("web.search").version == "1.10.0"  # still retrievable
 assert [s.name for s in registry.list(include_disabled=False)] == []
 registry.enable("web.search")
@@ -365,7 +378,55 @@ assert [(e.kind, e.version) for e in events] == [
 ]
 ```
 
-Descriptors are validated when they are created:
+**Version-level and name-level disabling.** `disable(name, version)` switches
+off one version. `disable(name)` switches off the whole tool name: every
+version, including a version pinned by a step and versions registered while the
+name stays disabled. A version counts as enabled only when neither it nor its
+name is disabled, so `enable(name, version)` cannot override a name-level
+disable; `enable(name)` clears the name-level flag and every per-version flag of
+that name. Each call emits exactly one event, naming the given version or, for
+a whole-name call, the latest version. Unregistering every version of a name
+forgets its flags.
+
+```python
+from orchestrator import RegistryEvent, ToolRegistry, ToolSpec
+
+
+async def calc(a: int) -> int:
+    return a
+
+
+registry = ToolRegistry()
+for version in ("1.0.0", "2.0.0"):
+    registry.register(ToolSpec(name="calc", version=version, capabilities=("calc",), handler=calc))
+events: list[RegistryEvent] = []
+registry.subscribe(events.append)
+
+registry.disable("calc", "1.0.0")                     # one version only
+assert not registry.is_enabled("calc", "1.0.0") and registry.is_enabled("calc", "2.0.0")
+assert [s.version for s in registry.find_by_capability("calc")] == ["2.0.0"]
+
+registry.disable("calc")                              # the whole name
+registry.register(ToolSpec(name="calc", version="3.0.0", capabilities=("calc",), handler=calc))
+assert not any(registry.is_enabled("calc", v) for v in registry.versions("calc"))
+assert registry.find_by_capability("calc") == []
+
+registry.enable("calc", "2.0.0")                      # does not override the name-level disable
+assert not registry.is_enabled("calc", "2.0.0")
+registry.enable("calc")                               # clears every flag of the name
+assert all(registry.is_enabled("calc", v) for v in registry.versions("calc"))
+
+assert [(e.kind, e.version) for e in events] == [
+    ("disabled", "1.0.0"),
+    ("disabled", "2.0.0"),     # whole-name call: names the latest version at the time
+    ("registered", "3.0.0"),
+    ("enabled", "2.0.0"),
+    ("enabled", "3.0.0"),
+]
+```
+
+Descriptors are validated when they are created. Names and versions must match
+in full, so a trailing newline is rejected too:
 
 ```python
 from orchestrator import Capability, ToolSpec, ValidationError, parse_version
@@ -383,8 +444,11 @@ assert parse_version("2.10.3") == (2, 10, 3)
 
 bad_specs = [
     dict(name="Bad Name", version="1.0.0", capabilities=("x",), handler=handler),
+    dict(name="ok\n", version="1.0.0", capabilities=("x",), handler=handler),
     dict(name="ok", version="1.0", capabilities=("x",), handler=handler),
+    dict(name="ok", version="1.0.0\n", capabilities=("x",), handler=handler),
     dict(name="ok", version="1.0.0", capabilities=(), handler=handler),
+    dict(name="ok", version="1.0.0", capabilities=("x\n",), handler=handler),
     dict(name="ok", version="1.0.0", capabilities=("x",), handler=sync_handler),
 ]
 for kwargs in bad_specs:
@@ -395,21 +459,33 @@ for kwargs in bad_specs:
     else:
         raise AssertionError(f"accepted {kwargs}")
 
-for bad in (dict(name="x", cost=-1), dict(name="x", latency=-1), dict(name="UPPER")):
+bad_capabilities = [
+    dict(name="UPPER"),
+    dict(name="x", cost=-1),
+    dict(name="x", latency=-1),
+    dict(name="x", cost=float("nan")),
+    dict(name="x", latency=True),       # booleans are not numbers here
+    dict(name="x", priority=True),      # priority must be a real int...
+    dict(name="x", priority=1.0),       # ...not a bool or a float
+]
+for bad in bad_capabilities:
     try:
         Capability(**bad)
     except ValidationError:
         pass
     else:
         raise AssertionError(f"accepted {bad}")
+
+# An infinite cost or latency is allowed: it means "avoid unless nothing else is left".
+assert Capability("x", cost=float("inf")).cost == float("inf")
 ```
 
 **Reference**
 
 | `ToolSpec` field | Meaning |
 | --- | --- |
-| `name` | lowercase `[a-z0-9][a-z0-9_.-]*` |
-| `version` | `MAJOR.MINOR.PATCH`; compared numerically |
+| `name` | lowercase ASCII `[a-z0-9][a-z0-9_.-]*`, matched in full (no trailing newline) |
+| `version` | `MAJOR.MINOR.PATCH` (no leading zeros, no trailing newline); compared numerically |
 | `capabilities` | `Capability` objects or plain names (converted); at least one |
 | `handler` | an `async def` function called as `handler(**args)` |
 | `description` | free text |
@@ -420,17 +496,17 @@ for bad in (dict(name="x", cost=-1), dict(name="x", latency=-1), dict(name="UPPE
 | `Capability` field | Default | Used by |
 | --- | --- | --- |
 | `name` | | capability lookup (same naming rule as tools) |
-| `cost` | `1.0` | `cheapest`, `balanced` (must be `>= 0`) |
-| `latency` | `1.0` | `fastest`, `balanced` (must be `>= 0`) |
-| `priority` | `0` | `priority`, `balanced`, fan-out `metadata["priority"]` |
+| `cost` | `1.0` | `cheapest`, `balanced` (a non-negative int or float; NaN and booleans are rejected, `float("inf")` is accepted) |
+| `latency` | `1.0` | `fastest`, `balanced` (same rules as `cost`) |
+| `priority` | `0` | `priority`, `balanced`, fan-out `metadata["priority"]` (a real `int`; `True` or `1.0` is rejected) |
 
 | `ToolRegistry` method | Behaviour |
 | --- | --- |
 | `register(spec, *, replace=False)` | adds `name@version`; `DuplicateToolError` unless `replace` |
-| `unregister(name, version=None)` | removes one version or all of them; returns the removed specs |
-| `enable(name, version=None)` / `disable(...)` | toggles a version (default: the latest); disabled tools stay retrievable |
+| `unregister(name, version=None)` | removes one version or all of them; returns the removed specs. Removing every version forgets the name's enable/disable flags |
+| `enable(name, version=None)` / `disable(...)` | with a version, toggles that version; without one, disables or enables the whole tool name, meaning **every** version, including versions registered later. `enable(name)` also clears every per-version flag of the name, while `enable(name, version)` does not override a name-level disable. Each call emits exactly one event naming the given version, or the latest version for a whole-name call. Disabled tools stay retrievable |
 | `get(name, version=None)` | the pinned version, or the latest; `ToolNotFoundError` |
-| `is_enabled(name, version=None)` | whether that version is enabled |
+| `is_enabled(name, version=None)` | whether that version (default: the latest) **and** its tool name are enabled |
 | `list(*, include_disabled=True)` | latest version of every name, sorted by name |
 | `versions(name)` | all versions, oldest first; `ToolNotFoundError` for an unknown name |
 | `find_by_capability(cap)` | tools offering `cap` whose latest version is enabled (an older enabled version never stands in) |
@@ -525,7 +601,7 @@ assert BALANCED_WEIGHTS == {"priority": 0.4, "cost": 0.2, "latency": 0.2, "healt
 | `priority` | `(priority, -cost, -latency)` |
 | `cheapest` | `(-cost, priority, -latency)` |
 | `fastest` | `(-latency, priority, -cost)` |
-| `balanced` (default) | weighted score, below |
+| `balanced` (default) | weighted score, below; always finite |
 | callable | `fn(spec, capability, stats) -> float`; a non-numeric or NaN score raises `ValidationError` |
 
 **The balanced formula.** The components are normalised over the *current
@@ -542,6 +618,40 @@ score      = 0.4 * priority_n + 0.2 * cheap_n + 0.2 * fast_n + 0.2 * success_rat
 `success_rate` is `successes / calls`, or `1.0` while nothing has been observed.
 A tool's score is relative to its peers, so it changes as tools come and go.
 `explain()` shows the score used for each request.
+
+**Infinite hints.** A capability may declare `cost=float("inf")` or
+`latency=float("inf")`. Under `priority`, `cheapest` and `fastest` an infinite
+hint ranks after every finite one (it becomes `-inf` in the ranking key). The
+balanced score always stays finite: when the largest cost (or latency) among the
+candidates is infinite, an infinite hint scores `0.0` for that component and a
+finite one `1.0`, instead of the NaN that `inf / inf` would produce.
+
+```python
+import math
+
+from orchestrator import Capability, CapabilityRouter, ToolRegistry, ToolSpec
+
+
+def make_tool(name: str, **hints) -> ToolSpec:
+    async def handler(**_):
+        return name
+    return ToolSpec(name=name, version="1.0.0",
+                    capabilities=(Capability("search", **hints),), handler=handler)
+
+
+registry = ToolRegistry()
+registry.register(make_tool("metered", cost=float("inf"), latency=float("inf")))
+registry.register(make_tool("normal", cost=50.0, latency=9.0))
+router = CapabilityRouter(registry)
+
+for strategy in ("priority", "cheapest", "fastest", "balanced"):
+    assert [s.name for s in router.candidates("search", strategy=strategy)] == [
+        "normal", "metered",
+    ]
+rows = router.explain("search")
+assert all(math.isfinite(row.score) for row in rows)
+assert [(row.tool, round(row.score, 2)) for row in rows] == [("normal", 1.0), ("metered", 0.6)]
+```
 
 **Health and the circuit breaker.** Callers report outcomes with
 `record_success(name, latency=None)` and `record_failure(name)`; the
@@ -1125,8 +1235,18 @@ never breaks the run.
 When several tools answer the same request, `ConflictResolver(default_strategy=
 "majority", *, priorities=None)` reconciles their `ToolResult`s into a single
 `Resolution(value, strategy, winners, dissenters, confidence, details)`. Only
-results with `ok=True` take part. Values are compared structurally, through
-canonical JSON in which the order of dict keys does not matter.
+results with `ok=True` take part. Values are compared structurally and
+type-aware, and the order of dict keys does not matter:
+
+- numbers compare by value, so `1` equals `1.0`, but a boolean only equals a
+  boolean (`True` is not `1`);
+- strings, bytes and numbers never equal each other (`"1"` is not `1`, and
+  `b"a"` is not `"a"`);
+- a list equals a list and a tuple a tuple, element by element, but a list
+  never equals a tuple;
+- dict keys follow the same rules (`{1: x}` matches `{1.0: x}` but not
+  `{"1": x}`);
+- NaN equals NaN, so identical NaN answers group together.
 
 ```python
 from orchestrator import ConflictError, ConflictResolver, ToolResult, ValidationError
@@ -1147,8 +1267,9 @@ resolver = ConflictResolver()
 assert resolver.default_strategy == "majority"
 assert resolver.strategies == ("first_success", "majority", "merge", "numeric", "priority")
 
-# majority: the largest group of equal values wins; ties go to the group whose
-# best member has the highest priority, then to the lowest tool name.
+# majority: the largest group of equal values wins; ties go to the group containing
+# the highest priority among all its members, then to the group containing the
+# smallest tool name among all its members.
 res = resolver.resolve(answers)
 assert (res.value, res.winners, res.dissenters) == (42, ("a", "b"), ("c",))
 assert round(res.confidence, 3) == 0.667
@@ -1188,6 +1309,60 @@ except ValidationError:
     pass
 else:
     raise AssertionError("expected ValidationError")
+```
+
+**Equality, tie-breaks and numeric edge cases.**
+
+```python
+from orchestrator import ConflictError, ConflictResolver, ToolResult
+
+
+def result(tool, value, priority=0):
+    return ToolResult(tool=tool, version="1.0.0", ok=True, value=value,
+                      metadata={"priority": priority})
+
+
+resolver = ConflictResolver()
+
+# Type-aware equality: 1 == 1.0, but True is not 1; lists, tuples and strings differ.
+res = resolver.resolve([result("a", 1), result("b", 1.0), result("c", True)])
+assert (res.value, res.winners, res.dissenters) == (1, ("a", "b"), ("c",))
+res = resolver.resolve([result("a", [1]), result("b", (1,)), result("c", "1")])
+assert res.details["groups"] == [["a"], ["b"], ["c"]]       # three singletons
+res = resolver.resolve([result("a", {1: "x"}), result("b", {1.0: "x"}), result("c", {"1": "x"})])
+assert res.winners == ("a", "b")
+res = resolver.resolve([result("a", float("nan")), result("b", float("nan")), result("c", 0)])
+assert res.winners == ("a", "b")                             # NaN groups with NaN
+
+# Tie-break: two groups of two. "B" contains the highest priority of any member (bob: 9).
+res = resolver.resolve([
+    result("zed", "A", priority=5), result("amy", "B", priority=1),
+    result("bob", "B", priority=9), result("cat", "A", priority=1),
+])
+assert (res.value, res.winners) == ("B", ("amy", "bob"))
+assert res.details == {"groups": [["amy", "bob"], ["zed", "cat"]], "tie_broken": True,
+                       "quorum": None}
+
+# numeric: booleans, inf, -inf and NaN are rejected, and so is an overflowing
+# aggregate or spread; the strategy never returns inf.
+bad_inputs = [
+    ([True, 1], "mean"),
+    ([float("inf"), 1.0], "mean"),
+    ([float("nan"), 1.0], "max"),
+    ([1e308, 1e308], "median"),          # (a + b) / 2 would overflow to inf
+    ([-1.7e308, 1.7e308], "min"),        # the spread high - low overflows
+]
+for values, agg in bad_inputs:
+    try:
+        resolver.resolve([result(f"t{i}", v) for i, v in enumerate(values)], "numeric", agg=agg)
+    except ConflictError:
+        pass
+    else:
+        raise AssertionError(f"accepted {values} with agg={agg}")
+
+# Equal huge integers are aggregated exactly, without going through float.
+res = resolver.resolve([result("a", 10**400), result("b", 10**400)], "numeric")
+assert res.value == 10**400 and res.confidence == 1.0
 ```
 
 **Merging and custom strategies.**
@@ -1249,10 +1424,10 @@ assert "unanimous" in resolver.strategies
 | Strategy | Options | Value | Winners / confidence |
 | --- | --- | --- | --- |
 | `first_success` | none | first successful value | equal-valued participants / share |
-| `majority` (default) | `quorum` in `(0, 1]` | largest group's value | that group / its share; `ConflictError` if share < quorum |
+| `majority` (default) | `quorum` in `(0, 1]` | largest group's value (ties: highest member priority, then smallest member name; `details["tie_broken"]`) | that group / its share; `ConflictError` if share < quorum |
 | `priority` | none | value of the highest-priority result (ties: lowest tool name) | equal-valued participants / share; `details["selected"]`, `details["priority"]` |
 | `merge` | `on_conflict`: `error` (default), `priority`, `first` | recursive dict merge, list union (non-dict values must all be equal) | non-dissenters / share; `details["conflicts"]`, `details["conflicting_paths"]` |
-| `numeric` | `agg`: `mean` (default), `median`, `min`, `max` | aggregate | all / `1 - spread / scale` |
+| `numeric` | `agg`: `mean` (default), `median`, `min`, `max` | aggregate of finite `int`/`float` values (exact for ints); booleans, `inf`, `-inf`, NaN and an overflowing aggregate or spread raise `ConflictError` | all / `1 - spread / scale` |
 | callable or registered name | any | returned value or `Resolution` | computed as for `first_success` when a plain value is returned |
 
 `resolve(results, strategy=None, **options)` uses the resolver's
@@ -1473,15 +1648,21 @@ directly. If the tool is unknown, the step fails with `ToolNotFoundError`; if it
 is disabled, with `ExecutionError`; if the args fail its input schema, with
 `ValidationError`; and if the principal may not use it, with
 `AccessDeniedError`. A named-tool step never falls back to another tool.
+"Disabled" includes a pinned older version of a tool whose whole name was
+disabled with `disable(name)`: such a step fails with `ExecutionError`
+(`calc@1.0.0 is disabled`) instead of running the old version. To switch off
+just one version, use `disable(name, version)`.
 
 A step that names a `capability` is routed among the tools the principal may
 use. If the chosen tool raises, returns
 `ok=False` or exceeds `tool_timeout`, the orchestrator tries the next candidate,
 up to `max_fallbacks` extra tools. The step then fails with
 `FallbackExhaustedError`, chained to the last tool error. A candidate whose input
-schema rejects the args is skipped without counting as a failure. If no tool
-was invoked at all, the step fails with `NoRouteError`, or with the input's
-`ValidationError` when every candidate rejected the args.
+schema rejects the args is skipped without counting as a failure, and so is a
+candidate found unavailable right before invocation (see
+[Invocation-time checks](#invocation-time-checks)). If no tool was invoked at
+all, the step fails with `NoRouteError`, or with the input's `ValidationError`
+when every candidate rejected the args.
 
 ```python
 import asyncio
@@ -1608,7 +1789,11 @@ candidates for that capability step are invoked concurrently, and their results
 are reconciled by the orchestrator's `ConflictResolver`.
 
 - A tool that fails is left out of the reconciliation, and the failure is
-  reported to the router.
+  reported to the router. A member found unavailable right before invocation
+  (disabled, unregistered or replaced after the members were chosen) counts as
+  a failed member too, but is not reported to the router. If every member
+  fails, the step fails with `ConflictError` (`no successful results to
+  reconcile`).
 - The step's output is the reconciled value. Its result has
   `tool="fanout:<capability>"` and `metadata["resolution"]`.
 - `report.resolutions[step_id]` holds the `Resolution`, and
@@ -1746,7 +1931,7 @@ its tool and is not retried, and the steps that depend on it are skipped.
 | Issue kind | Step type | Meaning |
 | --- | --- | --- |
 | `unknown_tool` | named tool | no such tool or version |
-| `disabled` | named tool | the tool (version) is disabled |
+| `disabled` | named tool | the tool version, or its whole name, is disabled |
 | `denied` | named tool | the principal may not use the tool |
 | `no_route` | capability | no enabled, permitted tool with a closed or half-open circuit offers it |
 
@@ -1832,7 +2017,9 @@ on the other, the run reports the pair in `report.contentions` and
 run as `<run_id>/<step_id>`, so concurrent runs whose steps share an id never
 collide. A malformed `metadata["resources"]` declaration (not a mapping, or a
 mode other than `read` or `write`) raises `ValidationError` when a run that
-names the tool starts.
+names the tool starts. The claims are computed when the run starts and are
+verified again right before the tool is invoked (see
+[Invocation-time checks](#invocation-time-checks)).
 
 ```python
 import asyncio
@@ -1889,9 +2076,19 @@ asyncio.run(main())
 It also provides `chains` (step id to the names of the tools tried) and
 `warnings`, and it delegates `ok`, `outputs`, `results`, `succeeded`, `failed`,
 `skipped`, `cancelled`, `duration`, `report[step_id]` and `raise_for_failure()`
-to `execution`. A `ToolAttempt.outcome` is one of `ok`, `error`, `timeout`,
-`invalid_input`, `denied` or `cancelled`, and its `attempt` field is the
-executor attempt number (1 for the first try, 2 for the first retry).
+to `execution`. Its `attempt` field is the executor attempt number (1 for the
+first try, 2 for the first retry). A `ToolAttempt.outcome` is one of:
+
+| Outcome | Meaning |
+| --- | --- |
+| `ok` | the tool returned a successful result |
+| `error` | the tool raised or returned `ok=False` |
+| `timeout` | the tool exceeded `tool_timeout` |
+| `invalid_input` | the args failed the tool's input schema; not invoked |
+| `denied` | the principal may not use the tool; not invoked |
+| `cancelled` | a step timeout, fail-fast or run cancellation interrupted the tool; not reported to the router |
+| `unavailable` | the tool was no longer registered, was replaced or was disabled right before invocation; not invoked and not reported to the router |
+| `claims_changed` | a named-tool step's tool needs resource claims (merged with the step's own) that the locks the step holds do not cover, for example because the tool was replaced mid-run with a new write claim; not invoked, and the step fails with `ExecutionError` |
 
 | `OrchestratorEvent.kind` | Source | `tool` | Detail |
 | --- | --- | --- | --- |
@@ -1944,8 +2141,9 @@ asyncio.run(main())
 
 The orchestrator reads the registry on every request, so registering,
 disabling, enabling or unregistering a tool takes effect on the next routing
-decision or pre-flight check. Unregistering a tool also clears its router
-health. `orch.close()` stops that subscription, and calling it twice is safe.
+decision, pre-flight check or invocation, even in the middle of a run.
+Unregistering a tool also clears its router health. `orch.close()` stops that
+subscription, and calling it twice is safe.
 
 ```python
 import asyncio
@@ -1983,6 +2181,122 @@ async def main() -> None:
 
     orch.close()
     orch.close()                                                # idempotent
+
+
+asyncio.run(main())
+```
+
+### Invocation-time checks
+
+Routing, pre-flight and claim merging happen before a tool runs, and the
+registry can change in between: an event listener, another task or an earlier
+step may disable, unregister or replace a tool. So right before **every** tool
+invocation (a named-tool step, each capability candidate including fallbacks,
+and each fan-out member) the orchestrator re-checks that the exact descriptor it
+is about to call is still registered under its name and version, and is
+enabled. A tool that fails the check is never invoked, is not reported to the
+router, and is recorded with the attempt outcome `unavailable`:
+
+- a **named-tool step** fails that attempt with `ExecutionError`;
+- a **capability step** skips the candidate and moves to the next one, without
+  using up `max_fallbacks` and without a `fallback` event. If no candidate is
+  left and none ran, the step fails with `NoRouteError`;
+- a **fan-out member** counts as a failed member, and the step is reconciled
+  from the other members' results.
+
+A named-tool step also re-verifies its **resource claims**. They were computed
+when the run started (the tool's `metadata["resources"]` merged with the step's
+own `resources`) and locked before the attempt began. If the tool has since been
+replaced, or a newer version registered, with claims that the held locks do not
+cover (a held `write` covers a `read`), the tool is not invoked: the attempt
+fails with `ExecutionError` and is recorded as `claims_changed`. The step is not
+re-locked mid-run; a new run picks up the new claims.
+
+A handler that is already running when its tool is disabled or unregistered
+keeps running; the checks only stop invocations that have not started yet.
+
+```python
+import asyncio
+
+from orchestrator import Capability, Orchestrator, Principal, Step, ToolSpec
+
+
+def switch_off_alpha(event) -> None:
+    if event.kind == "routed" and event.tool == "alpha":
+        orch.registry.disable("alpha")          # between routing and invocation
+
+
+orch = Orchestrator(max_fallbacks=0, on_event=switch_off_alpha)
+
+
+@orch.tool(capabilities=Capability("search", priority=9))
+async def alpha(query: str) -> str:
+    return "alpha"
+
+
+@orch.tool(capabilities=Capability("search", priority=1))
+async def beta(query: str) -> str:
+    return "beta"
+
+
+async def calc_v1(a: int) -> int:
+    return a
+
+
+async def calc_v2(a: int) -> int:
+    return 2 * a
+
+
+for version, handler in (("1.0.0", calc_v1), ("2.0.0", calc_v2)):
+    orch.register(ToolSpec(name="calc", version=version, capabilities=("calc",), handler=handler))
+
+
+@orch.tool
+async def report() -> str:
+    return "old report"
+
+
+async def new_report() -> str:
+    return "new report"
+
+
+@orch.tool
+async def upgrade() -> str:
+    """Replace `report` with a version that writes to the database."""
+    orch.register(ToolSpec(name="report", version="1.0.0", capabilities=("report",),
+                           handler=new_report, metadata={"resources": {"db": "write"}}),
+                  replace=True)
+    return "upgraded"
+
+
+async def main() -> None:
+    who = Principal("p")
+
+    # alpha is disabled after it was routed: skipped without using the fallback budget.
+    run = await orch.run([Step("s", capability="search", args={"query": "q"})], principal=who)
+    assert run.outputs == {"s": "beta"}
+    assert [(a.tool, a.outcome) for a in run.attempts["s"]] == [
+        ("alpha", "unavailable"), ("beta", "ok"),
+    ]
+    assert "fallback" not in [e.kind for e in run.events]
+    assert orch.router.stats("alpha").calls == 0              # not reported to the router
+    orch.registry.enable("alpha")
+
+    # A pinned older version of a name-disabled tool does not run.
+    orch.registry.disable("calc")
+    run = await orch.run([Step("c", tool="calc", version="1.0.0", args={"a": 1})], principal=who)
+    assert run["c"].error == "ExecutionError: tool calc@1.0.0 is disabled"
+    assert [i.kind for i in run.issues] == ["disabled"]
+
+    # report is replaced mid-run with a write claim on "db" that step "r" never locked.
+    run = await orch.run([Step("u", tool="upgrade"), Step("r", tool="report", depends_on=["u"])],
+                         principal=who)
+    assert [(a.tool, a.outcome) for a in run.attempts["r"]] == [("report", "claims_changed")]
+    assert run["r"].error.startswith("ExecutionError: tool report@1.0.0 needs resource claims")
+
+    # The next run locks the new claims up front and invokes the new descriptor.
+    run = await orch.run([Step("r", tool="report")], principal=who)
+    assert run.outputs == {"r": "new report"}
 
 
 asyncio.run(main())
@@ -2113,11 +2427,11 @@ from the package root.
 | `DuplicateToolError` | `OrchestratorError` | registering an existing `name@version` without `replace=True` |
 | `PermissionDeniedError` | `OrchestratorError` | base class for permission failures |
 | `AccessDeniedError` | `PermissionDeniedError` | `policy.check` denies access (and so does a step's authorization), or `narrow` or `delegate` asks for scopes beyond the delegator's authority; carries `principal_id`, `tool`, `version`, `missing` and `reason` |
-| `NoRouteError` | `OrchestratorError` | no enabled, eligible tool with a closed or half-open circuit offers the capability; a capability step with no permitted candidate |
-| `ExecutionError` | `OrchestratorError` | a disabled tool is invoked; `raise_for_failure()` on a failed run; `call` gets `ok=False`; `default_invoker` gets a capability step; an invoker returns something other than a `ToolResult` |
+| `NoRouteError` | `OrchestratorError` | no enabled, eligible tool with a closed or half-open circuit offers the capability; a capability step with no permitted candidate, or whose every candidate was unavailable at invocation |
+| `ExecutionError` | `OrchestratorError` | a disabled tool is invoked (including a pinned version of a name-disabled tool); a named step's tool is unavailable at invocation or its claims changed; `raise_for_failure()` on a failed run; `call` gets `ok=False`; `default_invoker` gets a capability step; an invoker returns something other than a `ToolResult` |
 | `ToolTimeoutError` | `ExecutionError`, `TimeoutError` | a step attempt exceeds its timeout, or a tool exceeds `tool_timeout` |
 | `FallbackExhaustedError` | `ExecutionError` | every tool tried for a capability step failed, or `max_fallbacks` was exceeded; carries `step_id`, `capability` and `attempts` |
-| `ConflictError` | `OrchestratorError` | there is nothing successful to reconcile, the majority quorum is not met, a merge conflicts under `on_conflict="error"` (or gets unequal non-dict values), or `numeric` gets non-numbers; a lock is requested re-entrantly, times out or is entered twice |
+| `ConflictError` | `OrchestratorError` | there is nothing successful to reconcile, the majority quorum is not met, a merge conflicts under `on_conflict="error"` (or gets unequal non-dict values), or `numeric` gets non-numbers, booleans, `inf`, `-inf` or NaN, or its aggregate or spread overflows; a lock is requested re-entrantly, times out or is entered twice |
 | `PreflightError` | `OrchestratorError` | `run(..., preflight=True)` finds issues; carries `issues` |
 
 ```python
@@ -2150,8 +2464,10 @@ for error in (ConflictError, NoRouteError, PreflightError, PermissionDeniedError
 ```text
 .
 ├── .claude/                       OpenSpec slash commands (commands/opsx) and skills for Claude Code
+├── .github/workflows/ci.yml       CI: tests on Python 3.11-3.13, ruff, OpenSpec validation
+├── LICENSE                        MIT license
 ├── README.md                      this guide (its Python blocks are tested)
-├── pyproject.toml                 package metadata; no runtime dependencies
+├── pyproject.toml                 package metadata, MIT license, ruff and pytest settings; no runtime dependencies
 ├── openspec/
 │   ├── config.yaml                OpenSpec project context (schema: spec-driven)
 │   ├── specs/<capability>/spec.md the current, archived specifications
@@ -2210,17 +2526,18 @@ openspec validate <spec> --type spec --strict
 
 | Capability | Requirements | Spec | Code |
 | --- | --- | --- | --- |
-| Tool registry | 7 | [openspec/specs/tool-registry/spec.md](openspec/specs/tool-registry/spec.md) | `core.py`, `registry.py` |
+| Tool registry | 8 | [openspec/specs/tool-registry/spec.md](openspec/specs/tool-registry/spec.md) | `core.py`, `registry.py` |
 | Capability routing | 17 | [openspec/specs/capability-routing/spec.md](openspec/specs/capability-routing/spec.md) | `router.py` |
 | Permission scoping | 11 | [openspec/specs/permission-scoping/spec.md](openspec/specs/permission-scoping/spec.md) | `permissions.py` |
 | Parallel execution | 14 | [openspec/specs/parallel-execution/spec.md](openspec/specs/parallel-execution/spec.md) | `executor.py` |
 | Conflict resolution | 23 | [openspec/specs/conflict-resolution/spec.md](openspec/specs/conflict-resolution/spec.md) | `conflicts.py` |
-| Orchestrator agent | 21 | [openspec/specs/orchestrator-agent/spec.md](openspec/specs/orchestrator-agent/spec.md) | `agent.py`, `examples.py`, `__main__.py` |
+| Orchestrator agent | 24 | [openspec/specs/orchestrator-agent/spec.md](openspec/specs/orchestrator-agent/spec.md) | `agent.py`, `examples.py`, `__main__.py` |
 
-The counts come from `openspec list --specs` (six specs, 93 requirements in
-all), and `tests/test_readme.py` checks every count against the spec files. All
-six specs pass `openspec validate --specs --strict`, and `openspec list` reports
-no active changes.
+The counts come from `openspec list --specs`, and `tests/test_readme.py` checks
+every count against the spec files, so the table cannot silently drift. Every
+spec passes `openspec validate --specs --strict` (CI enforces this, together
+with `openspec validate --all --strict`), and once a change is archived,
+`openspec list` reports no active changes.
 
 **Changes**
 
@@ -2232,6 +2549,8 @@ no active changes.
 | [add-conflict-resolution](openspec/changes/archive/2026-10-17-add-conflict-resolution) | archived 2026-10-17 | `ConflictResolver`, `ResourceLockManager` |
 | [add-parallel-execution](openspec/changes/archive/2026-10-17-add-parallel-execution) | archived 2026-10-17 | `Plan`, `Step`, `Ref`, `ParallelExecutor` |
 | [add-orchestrator-agent](openspec/changes/archive/2026-10-19-add-orchestrator-agent) | archived 2026-10-19 | `Orchestrator`, package API, demo, this README |
+| [clarify-edge-cases](openspec/changes/archive/2026-10-19-clarify-edge-cases) | archived 2026-10-19 | edge-case wording and scenarios: numeric strategy rejects booleans and non-finite values (an overflowing `median` or spread is now a `ConflictError`), type-aware majority equality and tie-break, infinite cost/latency ranked last, NaN hints and trailing-newline names rejected |
+| [lift-design-limits](openspec/changes/archive/2026-10-19-lift-design-limits) | archived 2026-10-19 | name-level `disable(name)` covering every version (including later ones); invocation-time availability (`unavailable`) and resource-claim (`claims_changed`) checks in the orchestrator |
 
 ## Testing
 
@@ -2241,23 +2560,45 @@ python3 -m pytest -q tests/test_readme.py   # only the README examples
 python3 -m pytest -q -k fallback            # by keyword
 ```
 
-The latest full run of `python3 -m pytest -q` gave **559 passed**. The tests
-are deterministic and need no network. The async tests use `pytest-asyncio` in
+The tests exercise the requirement scenarios of every spec in `openspec/specs/`
+(each change's `tasks.md` names the scenarios its tests verify). They are
+deterministic and need no network. The async tests use `pytest-asyncio` in
 auto mode, and concurrency is checked with events, counters and controllable
-clocks rather than timing assumptions.
+clocks rather than timing assumptions. Run `python3 -m pytest -q` to see the
+current number of tests; this README deliberately does not quote it, so it
+cannot go stale.
 
-| Test module | Tests | Covers |
-| --- | ---: | --- |
-| `test_core.py` | 40 | descriptor and capability validation, version parsing, input validation |
-| `test_registry.py` | 14 | registration, duplicates and replacement, versions, enable/disable, events, listener isolation |
-| `test_router.py` | 64 | the four strategies, the balanced formula, custom strategies, filters, health, circuit breaker states, `route_many`, `explain`, concurrent recording |
-| `test_permissions.py` | 66 | the scope grammar and wildcards, roles, rules and decision order, delegation, the audit log |
-| `test_executor.py` | 72 | DAG validation, scheduling, the concurrency limit, timeouts, retries and backoff, skips, fail-fast, events, locks |
-| `test_conflicts.py` | 99 | every resolution strategy, custom strategies, lock semantics (FIFO, readers/writer, timeouts, cancellation) |
-| `test_agent.py` | 147 | every orchestrator-agent requirement and scenario, and the package interface |
-| `test_demo.py` | 12 | the example tools, `collect_demo`/`run_demo`, `python3 -m orchestrator` in a subprocess |
-| `test_integration.py` | 6 | end-to-end runs through the package root only: fallback, denial, fan-out, contention, delegation, health across runs, registry changes, concurrent runs |
-| `test_readme.py` | 39 | every python block in this README (one test each), per-section coverage, relative links, table-of-contents anchors, the spec index and its requirement counts, and the demo sample output |
+| Test module | Covers |
+| --- | --- |
+| `test_core.py` | descriptor and capability validation (including NaN, boolean and infinite hints, and trailing-newline names and versions), version parsing, input validation |
+| `test_registry.py` | registration, duplicates and replacement, versions, version-level and name-level enable/disable (including versions registered later), events, listener isolation |
+| `test_router.py` | the four strategies, the balanced formula, infinite hints, custom strategies, filters, health, circuit breaker states, `route_many`, `explain`, concurrent recording |
+| `test_permissions.py` | the scope grammar and wildcards, roles, rules and decision order, delegation, the audit log |
+| `test_executor.py` | DAG validation, scheduling, the concurrency limit, timeouts, retries and backoff, skips, fail-fast, events, locks |
+| `test_conflicts.py` | every resolution strategy, type-aware equality and tie-breaks, numeric edge cases (non-finite values, overflow, huge integers), custom strategies, lock semantics (FIFO, readers/writer, timeouts, cancellation) |
+| `test_agent.py` | every orchestrator-agent requirement and scenario, including the invocation-time availability and claim checks, and the package interface |
+| `test_demo.py` | the example tools, `collect_demo`/`run_demo`, `python3 -m orchestrator` in a subprocess |
+| `test_integration.py` | end-to-end runs through the package root only: fallback, denial, fan-out, contention, delegation, health across runs, registry changes, concurrent runs |
+| `test_readme.py` | every python block in this README (one test each), per-section coverage, relative links, table-of-contents anchors, the spec index and its requirement counts, the demo sample output, and the absence of hard-coded test counts |
+
+### Continuous integration
+
+The `CI` workflow ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs on
+every push to `main` and on every pull request. It has read-only permissions
+(`contents: read`), and a newer run on the same branch cancels the older one.
+It has three jobs:
+
+| Job | Runs on | Steps |
+| --- | --- | --- |
+| `test` | Python 3.11, 3.12 and 3.13 (matrix) | `pip install -e '.[dev]'`, `python -m pytest -q`, then a smoke run of the demo with `python -m orchestrator` |
+| `lint` | Python 3.13 | `ruff check src tests` |
+| `specs` | Node 22 with the OpenSpec CLI (`@fission-ai/openspec@1.14.3`, `OPENSPEC_TELEMETRY=0`) | `openspec validate --specs --strict` and `openspec validate --all --strict` |
+
+Ruff is configured in `[tool.ruff]` in `pyproject.toml`: target `py311`, line
+length 100, and the rule groups `E`, `F`, `W`, `I`, `UP`, `B`, `SIM` and `RUF`.
+`RUF001` (ambiguous characters) is turned off for `tests/**`, which use
+look-alike characters on purpose, and the `∪` sign is allowed everywhere.
+`ruff format` is not enforced yet.
 
 ## Design decisions and limitations
 
@@ -2294,9 +2635,19 @@ most when you use the library are these:
   invokes N tools. `max_concurrency` limits steps, not tool calls.
 - **Only named-tool steps inherit tool resource claims,** because the executor
   locks before routing happens. Put `resources` on a capability step yourself
-  if it needs locks.
+  if it needs locks. A named-tool step's claims are computed when the run
+  starts and re-verified right before invocation: if the tool was replaced, or
+  a newer version registered, with claims the held locks do not cover, the
+  attempt fails with outcome `claims_changed`. There is no mid-step re-locking;
+  a new run picks up the new claims.
 - **Pre-flight is a snapshot.** If the registry or policy changes after the
   check, the change is still enforced when the tool is invoked.
+- **Availability is checked at invocation, not during it.** A tool disabled or
+  unregistered mid-run is never invoked afterwards (outcome `unavailable`), but
+  a handler that is already running keeps running to completion.
+- **Disabling a name is total.** `disable(name)` disables every version,
+  including versions pinned by a step and versions registered later, until
+  `enable(name)`. Use `disable(name, version)` to switch off a single version.
 - **Outputs are shared by reference** between steps, so tools must treat their
   inputs as read-only.
 - **Locks are bound to one event loop and are not re-entrant.** A nested hold by
@@ -2327,13 +2678,30 @@ New behaviour goes through an OpenSpec change before any code is written:
 3. **Document.** Add a section with a runnable `python` example to this README.
    `tests/test_readme.py` executes every block, so use `text` or `bash` fences
    for anything that should not run.
-4. **Verify.** `python3 -m pytest -q`, `python3 -m orchestrator` and
-   `openspec validate <change> --strict` must all succeed.
+4. **Verify.** `openspec validate <change> --strict` must succeed, and so must
+   the local checks below.
 5. **Archive.** Run `openspec archive <change> -y` (or `/opsx:archive`), then
    `openspec list --specs`, and update the specification table above.
 
+Before you push, run the same checks that CI runs (see
+[Continuous integration](#continuous-integration)):
+
+```bash
+pip install -e '.[dev]'                 # pytest, pytest-asyncio and ruff
+python -m pytest -q                     # the full test suite, README examples included
+python -m orchestrator                  # demo smoke run; exits 0 only if every feature worked
+ruff check src tests                    # lint
+openspec validate --specs --strict      # the main specs
+openspec validate --all --strict        # every spec and change
+```
+
+The `openspec` commands need the OpenSpec CLI
+(`npm install -g @fission-ai/openspec@1.14.3`, Node 22 in CI); set
+`OPENSPEC_TELEMETRY=0` to match CI.
+
 ## License
 
-The repository does not contain a `LICENSE` file yet, and `pyproject.toml`
-declares no license. See the repository for the licensing terms before you
-reuse the code.
+This project is licensed under the MIT License; see [LICENSE](LICENSE).
+Copyright (c) 2026 imranmali. `pyproject.toml` declares it as a PEP 639 license
+expression (`license = "MIT"`, `license-files = ["LICENSE"]`), so the installed
+package metadata reports `License-Expression: MIT`.

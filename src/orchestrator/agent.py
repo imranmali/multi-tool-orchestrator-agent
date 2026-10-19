@@ -28,8 +28,10 @@ import dataclasses
 import itertools
 import logging
 import time
+from collections.abc import Callable, Iterable, Mapping
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
-from typing import Any, AsyncContextManager, Callable, Iterable, Mapping
+from typing import Any
 
 from .conflicts import (
     ConflictResolver,
@@ -76,7 +78,20 @@ __all__ = [
 
 CAPABILITY_PREFIX = "capability:"
 
-ATTEMPT_OUTCOMES = frozenset({"ok", "error", "timeout", "invalid_input", "denied", "cancelled"})
+ATTEMPT_OUTCOMES = frozenset(
+    {
+        "ok",
+        "error",
+        "timeout",
+        "invalid_input",
+        "denied",
+        "cancelled",
+        # not invoked: no longer registered, replaced or disabled right before invocation
+        "unavailable",
+        # not invoked: a named tool's resource claims are not covered by the held locks
+        "claims_changed",
+    }
+)
 ISSUE_KINDS = frozenset({"unknown_tool", "disabled", "denied", "no_route"})
 EVENT_KINDS = frozenset(
     {
@@ -277,7 +292,7 @@ class _RunLocks:
         self._manager = manager
         self._run_id = run_id
 
-    def hold(self, owner: str, resources: Mapping[str, str]) -> AsyncContextManager[Any]:
+    def hold(self, owner: str, resources: Mapping[str, str]) -> AbstractAsyncContextManager[Any]:
         return self._manager.hold(f"{self._run_id}/{owner}", resources)
 
 
@@ -290,11 +305,17 @@ class _RunContext:
         principal: Principal,
         fanout: Mapping[str, FanOut],
         listener: EventListener | None,
+        own_claims: Mapping[str, Mapping[str, str]] | None = None,
     ) -> None:
         self.run_id = run_id
         self.principal = principal
         self.fanout = dict(fanout)
         self.listener = listener
+        # Each step's own resource claims, before tool claims were merged in at run
+        # start; needed to recompute what a (possibly replaced) tool requires.
+        self.own_claims: dict[str, dict[str, str]] = {
+            sid: dict(claims) for sid, claims in (own_claims or {}).items()
+        }
         self.invocations: dict[str, int] = {}
         self.attempts: dict[str, list[ToolAttempt]] = {}
         self.served: dict[str, tuple[str, ...]] = {}
@@ -316,7 +337,7 @@ class _RunContext:
             return
         try:
             self.listener(event)
-        except Exception:  # noqa: BLE001 - observers must never break a run
+        except Exception:
             logger.exception("orchestrator event listener failed for %s", event)
 
     def on_step_event(self, event: StepEvent) -> None:
@@ -462,7 +483,9 @@ class Orchestrator:
         self._policy = policy if policy is not None else PermissionPolicy()
         self._router = router if router is not None else CapabilityRouter(registry)
         self._resolver = resolver if resolver is not None else ConflictResolver()
-        self._locks: LockManager = lock_manager if lock_manager is not None else ResourceLockManager()
+        self._locks: LockManager = (
+            lock_manager if lock_manager is not None else ResourceLockManager()
+        )
         self._run_ids = itertools.count(1)
         self._unsubscribe: Callable[[], None] | None = registry.subscribe(self._on_registry_event)
 
@@ -618,7 +641,7 @@ class Orchestrator:
             message = f"no permitted tool serves capability {step.capability!r}"
         except NoRouteError as exc:
             message = str(exc)
-        except Exception as exc:  # noqa: BLE001 - e.g. a custom routing strategy failing
+        except Exception as exc:
             # Routing itself is broken for this step: report it, and let the run fail
             # this step (the invoker hits the same error) instead of aborting the run.
             message = f"routing capability {step.capability!r} failed: {_describe(exc)}"
@@ -645,7 +668,10 @@ class Orchestrator:
         contentions = self._contentions(effective)
 
         run_id = f"run-{next(self._run_ids)}"
-        ctx = _RunContext(run_id, principal, fan, self._on_event)
+        ctx = _RunContext(
+            run_id, principal, fan, self._on_event,
+            own_claims={step.id: step.resources for step in plan},
+        )
 
         async def invoker(step: Step, args: dict[str, Any]) -> ToolResult:
             return await self._invoke_step(ctx, step, args)
@@ -694,7 +720,9 @@ class Orchestrator:
                 timeout=timeout,
             )
         else:
-            step = Step("call", tool=target, version=version, args=dict(args or {}), timeout=timeout)
+            step = Step(
+                "call", tool=target, version=version, args=dict(args or {}), timeout=timeout
+            )
         report = await self.run([step], principal)
         outcome = report["call"]
         if outcome.ok:
@@ -801,8 +829,7 @@ class Orchestrator:
     ) -> ToolResult:
         assert step.tool is not None
         spec = self._registry.get(step.tool, step.version)
-        if not self._registry.is_enabled(spec.name, spec.version):
-            raise ExecutionError(f"tool {spec.name}@{spec.version} is disabled")
+        self._ensure_available(ctx, step, spec, attempt)
         try:
             spec.validate_input(args)
         except ValidationError as exc:
@@ -811,10 +838,14 @@ class Orchestrator:
                 ToolAttempt(spec.name, spec.version, "invalid_input", _describe(exc), 0.0, attempt),
             )
             raise
+        self._ensure_claims_held(ctx, step, spec, attempt)
         ctx.emit(
             OrchestratorEvent("routed", step.id, tool=spec.name, attempt=attempt,
                               detail={"version": spec.version})
         )
+        # The listener may have changed the registry; nothing suspends from here on
+        # until the handler starts.
+        self._ensure_available(ctx, step, spec, attempt)
         self._authorize(ctx, step, spec, attempt)
         result = await self._attempt_tool(ctx, step, spec, args, attempt)
         if result.ok:
@@ -864,6 +895,11 @@ class Orchestrator:
                                   detail={"capability": capability, "version": spec.version})
             )
             try:
+                self._ensure_available(ctx, step, spec, attempt, record=record)
+            except ExecutionError as exc:  # like a denial: skip, no budget, no health
+                last_error = exc
+                continue
+            try:
                 self._authorize(ctx, step, spec, attempt, record=record)
             except AccessDeniedError as exc:  # defensive: predicate and check normally agree
                 last_error = exc
@@ -872,7 +908,7 @@ class Orchestrator:
             invoked = True
             try:
                 result = await self._attempt_tool(ctx, step, spec, args, attempt, record=record)
-            except Exception as exc:  # noqa: BLE001 - every tool failure may fall back
+            except Exception as exc:
                 last_error = exc
             else:
                 if result.ok:
@@ -957,16 +993,25 @@ class Orchestrator:
                                   detail={"capability": capability, "version": spec.version,
                                           "fanout": setting.n})
             )
+            cap = spec.capability(capability)
+            priority = cap.priority if cap is not None else 0
+            try:
+                # Members were selected before any of them ran; one that has since
+                # been disabled, unregistered or replaced is a failed member.
+                self._ensure_available(ctx, step, spec, attempt)
+            except ExecutionError as exc:
+                return ToolResult(
+                    spec.name, spec.version, ok=False, error=_describe(exc),
+                    metadata={"priority": priority},
+                )
             try:
                 self._authorize(ctx, step, spec, attempt)
             except AccessDeniedError as exc:
                 denials.append(exc)
                 return None
-            cap = spec.capability(capability)
-            priority = cap.priority if cap is not None else 0
             try:
                 result = await self._attempt_tool(ctx, step, spec, args, attempt)
-            except Exception as exc:  # noqa: BLE001 - a failed member is just ok=False
+            except Exception as exc:
                 return ToolResult(
                     spec.name, spec.version, ok=False, error=_describe(exc),
                     metadata={"priority": priority},
@@ -1009,6 +1054,74 @@ class Orchestrator:
             duration=time.perf_counter() - started,
             metadata={"resolution": resolution},
         )
+
+    # -- invocation-time checks -------------------------------------------------------------
+
+    def _unavailable_reason(self, spec: ToolSpec) -> str | None:
+        """Why ``spec`` may not be invoked right now, or None if it may."""
+        try:
+            current = self._registry.get(spec.name, spec.version)
+        except ToolNotFoundError:
+            return f"tool {spec.name}@{spec.version} is no longer registered"
+        if current is not spec:
+            return f"tool {spec.name}@{spec.version} was replaced after it was selected"
+        if not self._registry.is_enabled(spec.name, spec.version):
+            return f"tool {spec.name}@{spec.version} is disabled"
+        return None
+
+    def _ensure_available(
+        self,
+        ctx: _RunContext,
+        step: Step,
+        spec: ToolSpec,
+        attempt: int,
+        *,
+        record: Callable[[ToolAttempt], None] | None = None,
+    ) -> None:
+        """Raise ExecutionError (recording an ``unavailable`` attempt) unless the exact
+        descriptor ``spec`` is still registered and enabled. Never reported to the router."""
+        reason = self._unavailable_reason(spec)
+        if reason is None:
+            return
+        error = ExecutionError(reason)
+        entry = ToolAttempt(spec.name, spec.version, "unavailable", _describe(error), 0.0, attempt)
+        (record or (lambda a: ctx.add_attempt(step.id, a)))(entry)
+        raise error
+
+    def _ensure_claims_held(
+        self, ctx: _RunContext, step: Step, spec: ToolSpec, attempt: int
+    ) -> None:
+        """Raise ExecutionError (recording a ``claims_changed`` attempt) unless the locks
+        the step holds cover the claims ``spec`` needs, merged with the step's own.
+
+        The executor locked ``step.resources`` (claims computed at run start) before
+        calling the invoker; a tool replaced since then may need more.
+        """
+        own = ctx.own_claims.get(step.id, {})
+        try:
+            required = {**_tool_claims(spec), **own}
+        except ValidationError as exc:
+            problem = str(exc)
+        else:
+            held = step.resources
+            missing = {
+                resource: mode
+                for resource, mode in required.items()
+                if held.get(resource) not in ("write", mode)
+            }
+            if not missing:
+                return
+            problem = (
+                f"tool {spec.name}@{spec.version} needs resource claims {missing!r} that "
+                f"step {step.id!r} does not hold (held: {dict(held)!r}); the tool's claims "
+                "changed after the run started"
+            )
+        error = ExecutionError(problem)
+        ctx.add_attempt(
+            step.id,
+            ToolAttempt(spec.name, spec.version, "claims_changed", _describe(error), 0.0, attempt),
+        )
+        raise error
 
     # -- authorization and invocation -----------------------------------------------------
 
