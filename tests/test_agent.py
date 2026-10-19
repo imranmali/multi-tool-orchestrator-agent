@@ -927,6 +927,20 @@ class TestFanOut:
         outcomes = {a.tool: a.outcome for a in report.attempts["s"]}
         assert outcomes == {"a": "ok", "b": "error", "c": "ok"}
 
+    async def test_member_tool_timeout_counts_as_failure(self):
+        orch = make_orch(
+            make("sloth", priority=3, fn=slow),
+            make("a", priority=2, value="A"),
+            make("b", priority=1, value="A"),
+            tool_timeout=0.02,
+        )
+        report = await orch.run([Step("s", capability="search")], USER, fanout={"s": 3})
+        assert report.ok and report.outputs["s"] == "A"
+        assert set(report.resolutions["s"].winners) == {"a", "b"}
+        outcomes = {a.tool: a.outcome for a in report.attempts["s"]}
+        assert outcomes == {"sloth": "timeout", "a": "ok", "b": "ok"}
+        assert orch.router.stats("sloth").failures == 1
+
     async def test_runs_in_parallel(self):
         gate = asyncio.Event()
         arrived: list[str] = []
@@ -1321,6 +1335,7 @@ class TestPackageInterface:
             "CycleError",
             "ToolRegistry",
             "RegistryEvent",
+            "parse_version",
         ):
             assert hasattr(orchestrator, name) and name in orchestrator.__all__
 
@@ -1344,3 +1359,158 @@ class TestPackageInterface:
         assert orchestrator.__version__ == "0.1.0"
         pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
         assert pyproject["project"]["version"] == orchestrator.__version__
+
+
+# ---------------------------------------------------------------------------
+# adversarial review: regressions for bugs found in agent.py
+# ---------------------------------------------------------------------------
+
+
+async def spontaneous_cancel(**kwargs: Any) -> Any:
+    """A tool that raises CancelledError although nobody cancelled the caller."""
+    future = asyncio.get_running_loop().create_future()
+    future.cancel()
+    await future
+
+
+class TestAdversarial:
+    async def test_named_tool_raising_cancelled_error_fails_only_its_step(self):
+        orch = make_orch(make("t", ("t",), fn=spontaneous_cancel), make("ok", ("ok",)))
+        report = await asyncio.wait_for(
+            orch.run([Step("s", tool="t"), Step("x", tool="ok")], USER), 2
+        )
+        assert report.failed == ["s"] and report.succeeded == ["x"]
+        assert isinstance(report["s"].exception, ExecutionError)
+        assert [a.outcome for a in report.attempts["s"]] == ["error"]
+        assert orch.router.stats("t").failures == 1
+
+    async def test_capability_tool_raising_cancelled_error_falls_back(self):
+        orch = make_orch(make("a", priority=2, fn=spontaneous_cancel), make("b", priority=1))
+        report = await asyncio.wait_for(orch.run([Step("s", capability="search")], USER), 2)
+        assert report.ok and report.outputs["s"] == "b"
+        assert report.chains["s"] == ("a", "b")
+        assert report.attempts["s"][0].outcome == "error"
+        assert orch.router.stats("a").failures == 1
+
+    async def test_fanout_member_raising_cancelled_error_is_a_failed_member(self):
+        finished: list[str] = []
+
+        async def late(**kwargs: Any) -> str:
+            await asyncio.sleep(0.05)
+            finished.append("c")
+            return "C"
+
+        orch = make_orch(
+            make("a", priority=3, fn=spontaneous_cancel),
+            make("b", priority=2, value="C"),
+            make("c", priority=1, fn=late),
+        )
+        report = await asyncio.wait_for(
+            orch.run([Step("s", capability="search")], USER, fanout={"s": 3}), 2
+        )
+        assert finished == ["c"]  # no member is left running after the run returns
+        assert report.ok and report.outputs["s"] == "C"
+        assert set(report.resolutions["s"].winners) == {"b", "c"}
+        assert orch.router.stats("a").failures == 1
+
+    async def test_fanout_member_revoked_mid_fanout_is_not_invoked(self):
+        calls: list[str] = []
+        orch = make_orch()
+
+        async def revoker(**kwargs: Any) -> str:
+            orch.policy.deny(USER.id, "b")  # revoked before 'b' is invoked
+            await asyncio.sleep(0)
+            return "X"
+
+        orch.register(make("a", priority=2, fn=revoker, calls=calls))
+        orch.register(make("b", priority=1, value="X", calls=calls))
+        report = await orch.run([Step("s", capability="search")], USER, fanout={"s": 2})
+        assert calls == ["a"]
+        assert report.ok and report.outputs["s"] == "X"
+        assert ("denied", "b") in step_events(report, "s")
+        assert any(r.tool == "b" and not r.allowed for r in report.audit)
+        assert {a.tool: a.outcome for a in report.attempts["s"]}["b"] == "denied"
+
+    async def test_fanout_all_members_revoked_raises_denial(self):
+        calls: list[str] = []
+        orch = make_orch(make("a", calls=calls), make("b", calls=calls))
+        orch.policy.deny(USER.id, "a")
+        real_check = orch.policy.check
+
+        def check(principal: Principal, tool: ToolSpec) -> None:
+            orch.policy.deny(USER.id, "b")  # predicate allowed 'b'; the check does not
+            real_check(principal, tool)
+
+        orch.policy.check = check  # type: ignore[method-assign]
+        report = await orch.run([Step("s", capability="search")], USER, fanout={"s": 2})
+        assert calls == []
+        assert isinstance(report["s"].exception, AccessDeniedError)
+
+    async def test_fanout_authorization_error_leaves_no_member_running(self):
+        finished: list[str] = []
+
+        async def late(**kwargs: Any) -> str:
+            await asyncio.sleep(0.05)
+            finished.append("a")
+            return "A"
+
+        calls: list[str] = []
+        orch = make_orch(make("a", priority=2, fn=late), make("b", priority=1, calls=calls))
+        real_check = orch.policy.check
+
+        def check(principal: Principal, tool: ToolSpec) -> None:
+            if tool.name == "b":
+                raise RuntimeError("policy backend down")
+            real_check(principal, tool)
+
+        orch.policy.check = check  # type: ignore[method-assign]
+        report = await orch.run([Step("s", capability="search")], USER, fanout={"s": 2})
+        assert finished == ["a"] and calls == []
+        assert isinstance(report["s"].exception, RuntimeError)
+
+    async def test_fallback_event_names_the_tool_actually_routed_next(self):
+        orch = make_orch(
+            make("flaky", priority=3, fn=boom),
+            make("strict", priority=2, schema={"q": int}),
+            make("alpha", priority=1),
+        )
+        report = await orch.run([Step("s", capability="search", args={"q": "x"})], USER)
+        assert report.ok and report.served_by["s"] == ("alpha",)
+        fallback = [e for e in report.events if e.kind == "fallback"]
+        assert len(fallback) == 1 and fallback[0].detail["next"] == "alpha"
+
+    async def test_no_fallback_event_when_remaining_candidates_reject_input(self):
+        orch = make_orch(
+            make("flaky", priority=3, fn=boom),
+            make("strict", priority=2, schema={"q": int}),
+        )
+        report = await orch.run([Step("s", capability="search", args={"q": "x"})], USER)
+        assert isinstance(report["s"].exception, FallbackExhaustedError)
+        assert [k for k, _ in step_events(report, "s")] == ["started", "routed", "failed"]
+
+    async def test_routing_strategy_error_fails_step_not_run(self):
+        registry = ToolRegistry()
+        registry.register(make("calc", ("calc",)))
+        registry.register(make("weird"))
+        router = CapabilityRouter(registry, strategy=lambda spec, cap, st: float("nan"))
+        orch = Orchestrator(registry=registry, router=router)
+        plan = [Step("n", tool="calc"), Step("c", capability="search")]
+        issues = orch.check_plan(plan, USER)
+        assert [(i.step_id, i.kind) for i in issues] == [("c", "no_route")]
+        report = await orch.run(plan, USER)
+        assert report.succeeded == ["n"] and report.failed == ["c"]
+        assert isinstance(report["c"].exception, ValidationError)
+
+    async def test_tool_raising_timeout_error_is_not_reported_as_step_timeout(self):
+        async def own_timeout(**kwargs: Any) -> Any:
+            raise TimeoutError("upstream API timed out")
+
+        orch = make_orch(make("t", ("t",), fn=own_timeout))
+        with pytest.raises(ExecutionError) as info:
+            await orch.call("t", principal=USER)
+        assert not isinstance(info.value, ToolTimeoutError)
+        assert "upstream API timed out" in str(info.value)
+        assert isinstance(info.value.__cause__, TimeoutError)
+        report = await orch.run([Step("s", tool="t")], USER)
+        assert "upstream API timed out" in report["s"].error
+        assert [a.outcome for a in report.attempts["s"]] == ["error"]

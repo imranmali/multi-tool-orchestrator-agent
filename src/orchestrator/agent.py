@@ -31,7 +31,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncContextManager, Callable, Iterable, Mapping
 
-from .conflicts import ConflictResolver, Resolution, ResourceLockManager, detect_write_conflicts
+from .conflicts import (
+    ConflictResolver,
+    Resolution,
+    ResourceLockManager,
+    detect_write_conflicts,
+)
 from .core import (
     Capability,
     ExecutionError,
@@ -330,6 +335,21 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def _accepts(spec: ToolSpec, args: Mapping[str, Any]) -> bool:
+    try:
+        spec.validate_input(args)
+    except ValidationError:
+        return False
+    return True
+
+
+def _being_cancelled() -> bool:
+    """Whether the current task has a pending cancellation request (step timeout,
+    fail-fast, run cancellation), as opposed to a tool raising CancelledError itself."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
 def _positive_or_none(name: str, value: Any) -> float | None:
     if value is None:
         return None
@@ -591,13 +611,17 @@ class Orchestrator:
                 )
             return None
         assert step.capability is not None
-        if self._router.candidates(step.capability, eligible=eligible):
-            return None
         try:
+            if self._router.candidates(step.capability, eligible=eligible):
+                return None
             self._router.route(step.capability, eligible=eligible)
             message = f"no permitted tool serves capability {step.capability!r}"
         except NoRouteError as exc:
             message = str(exc)
+        except Exception as exc:  # noqa: BLE001 - e.g. a custom routing strategy failing
+            # Routing itself is broken for this step: report it, and let the run fail
+            # this step (the invoker hits the same error) instead of aborting the run.
+            message = f"routing capability {step.capability!r} failed: {_describe(exc)}"
         return PlanIssue(step.id, "no_route", step.target, message)
 
     # -- running ------------------------------------------------------------------
@@ -861,8 +885,19 @@ class Orchestrator:
             failures += 1
             if failures > self._max_fallbacks:
                 raise FallbackExhaustedError(step.id, capability, tried) from last_error
-            following = self._router.candidates(capability, eligible=eligible, exclude=excluded)
-            if following:
+            # Announce a fallback only to a candidate that will actually be routed: the
+            # loop skips candidates rejecting the arguments without routing them.
+            following = next(
+                (
+                    cand
+                    for cand in self._router.candidates(
+                        capability, eligible=eligible, exclude=excluded
+                    )
+                    if _accepts(cand, args)
+                ),
+                None,
+            )
+            if following is not None:
                 ctx.emit(
                     OrchestratorEvent(
                         "fallback",
@@ -870,7 +905,7 @@ class Orchestrator:
                         tool=spec.name,
                         attempt=attempt,
                         error=_describe(last_error),
-                        detail={"capability": capability, "next": following[0].name},
+                        detail={"capability": capability, "next": following.name},
                     )
                 )
 
@@ -910,9 +945,13 @@ class Orchestrator:
             self._router.route(capability, eligible=eligible, exclude=excluded)
             raise NoRouteError(f"no permitted tool serves capability {capability!r}")
 
-        permitted: list[ToolSpec] = []
-        first_denial: AccessDeniedError | None = None
-        for spec in selected:
+        started = time.perf_counter()
+        denials: list[AccessDeniedError] = []
+
+        async def one(spec: ToolSpec) -> ToolResult | None:
+            # Route, authorize and start the handler with no suspension point in between:
+            # a member that ran earlier in this fan-out may have changed the policy, so
+            # each member is checked right before its own invocation.
             ctx.emit(
                 OrchestratorEvent("routed", step.id, tool=spec.name, attempt=attempt,
                                   detail={"capability": capability, "version": spec.version,
@@ -920,17 +959,9 @@ class Orchestrator:
             )
             try:
                 self._authorize(ctx, step, spec, attempt)
-            except AccessDeniedError as exc:  # defensive, see _capability_step
-                first_denial = first_denial or exc
-                continue
-            permitted.append(spec)
-        if not permitted:
-            assert first_denial is not None
-            raise first_denial
-
-        started = time.perf_counter()
-
-        async def one(spec: ToolSpec) -> ToolResult:
+            except AccessDeniedError as exc:
+                denials.append(exc)
+                return None
             cap = spec.capability(capability)
             priority = cap.priority if cap is not None else 0
             try:
@@ -944,7 +975,15 @@ class Orchestrator:
                 result, metadata={**(result.metadata or {}), "priority": priority}
             )
 
-        results = await asyncio.gather(*(one(spec) for spec in permitted))
+        # return_exceptions: an unexpected error in one member must not leave the other
+        # members running unobserved after this step has failed.
+        outcomes = await asyncio.gather(*(one(spec) for spec in selected), return_exceptions=True)
+        for item in outcomes:
+            if isinstance(item, BaseException):
+                raise item
+        results = [item for item in outcomes if item is not None]
+        if not results:
+            raise denials[0]
         resolution = self._resolver.resolve(results, setting.strategy, **setting.options)
         ctx.resolutions[step.id] = resolution
         ctx.served[step.id] = tuple(resolution.winners)
@@ -1028,10 +1067,20 @@ class Orchestrator:
         started = time.perf_counter()
         try:
             result = await self._invoke_handler(spec, args)
-        except asyncio.CancelledError:
-            add(ToolAttempt(spec.name, spec.version, "cancelled", "cancelled",
+        except asyncio.CancelledError as exc:
+            if _being_cancelled():
+                add(ToolAttempt(spec.name, spec.version, "cancelled", "cancelled",
+                                time.perf_counter() - started, attempt))
+                raise
+            # Nobody cancelled this task: the tool itself raised CancelledError (e.g. it
+            # awaited a future someone else cancelled). Letting it propagate would make
+            # the executor treat the step as cancelled and abort the whole run, so it is
+            # a tool failure like any other.
+            error = ExecutionError(f"tool {spec.name}@{spec.version} raised CancelledError")
+            self._router.record_failure(spec.name)
+            add(ToolAttempt(spec.name, spec.version, "error", _describe(error),
                             time.perf_counter() - started, attempt))
-            raise
+            raise error from exc
         except ToolTimeoutError as exc:
             self._router.record_failure(spec.name)
             add(ToolAttempt(spec.name, spec.version, "timeout", _describe(exc),
@@ -1058,12 +1107,19 @@ class Orchestrator:
         try:
             async with deadline:
                 value = await spec.handler(**args)
-        except TimeoutError:
+        except TimeoutError as exc:
             if deadline.expired():
                 raise ToolTimeoutError(
                     f"tool {spec.name}@{spec.version} timed out after {self._tool_timeout}s"
                 ) from None
-            raise
+            if isinstance(exc, ToolTimeoutError):
+                raise
+            # The tool's own TimeoutError (e.g. an upstream client timing out). Passed on
+            # bare, the executor would take it for the *step* timing out and replace it
+            # with a misleading "step timed out" error, so wrap it as a tool failure.
+            raise ExecutionError(
+                f"tool {spec.name}@{spec.version} failed: {_describe(exc)}"
+            ) from exc
         duration = time.perf_counter() - started
         if isinstance(value, ToolResult):
             return dataclasses.replace(

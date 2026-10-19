@@ -37,6 +37,7 @@ from .core import (
     ToolSpec,
     ToolTimeoutError,
     ValidationError,
+    parse_version,
 )
 from .executor import (
     EventKind,
@@ -91,6 +92,7 @@ __all__ = [
     "ToolSpec",
     "ToolTimeoutError",
     "ValidationError",
+    "parse_version",
     # registry
     "RegistryEvent",
     "ToolRegistry",
